@@ -9,13 +9,13 @@ crawl-deamon 메인 실행 파일
 4. SETTING_JSON의 아이디/비밀번호로 팬더라이브 자동 로그인
 5. 랭킹 조회 및 상세 결과 선INSERT
 6. 대상별 실제 메시지 발송
-7. 실행 이력을 SUCCESS / PARTIAL_FAIL / FAIL로 변경
+7. 실행 이력을 SUCCESS / FAIL로 변경
 8. 작업 완료 여부와 관계없이 브라우저 종료
 9. 데몬은 브라우저 없이 다음 READY 작업 대기
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -28,7 +28,6 @@ from src.database.execution_repository import (
     claim_next_ready_execution,
     insert_execution_result,
     mark_execution_fail,
-    mark_execution_partial_fail,
     mark_execution_success,
     update_execution_result,
 )
@@ -50,7 +49,6 @@ LOG_DIR = PROJECT_ROOT / "logs"
 JOB_POLL_INTERVAL_SEC = 5
 DB_RECONNECT_INTERVAL_SEC = 10
 FILE_HEARTBEAT_INTERVAL_SEC = 300
-LOG_CLEANUP_INTERVAL_SEC = 24 * 60 * 60
 LOG_RETENTION_DAYS = 30
 
 
@@ -142,14 +140,14 @@ def ensure_database_connection(
 
 
 def cleanup_logs_if_due(
-        next_cleanup_at: float,
+        next_cleanup_at: datetime,
         logger,
         console_status: ConsoleStatus,
-) -> float:
+) -> datetime:
     """하루에 한 번 오래된 로그 파일을 삭제한다."""
-    now_monotonic = time.monotonic()
+    now = datetime.now()
 
-    if now_monotonic < next_cleanup_at:
+    if now < next_cleanup_at:
         return next_cleanup_at
 
     console_status.finish()
@@ -164,7 +162,14 @@ def cleanup_logs_if_due(
         LOG_RETENTION_DAYS,
     )
 
-    return now_monotonic + LOG_CLEANUP_INTERVAL_SEC
+    return (
+            now + timedelta(days=1)
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
 
 def print_claimed_job(
@@ -480,8 +485,14 @@ def main() -> None:
         next_file_heartbeat_at = (
                 time.monotonic() + FILE_HEARTBEAT_INTERVAL_SEC
         )
+        # 현재 시간 가져와서 하루 더하고 자정으로 변경
         next_log_cleanup_at = (
-                time.monotonic() + LOG_CLEANUP_INTERVAL_SEC
+                datetime.now() + timedelta(days=1)
+        ).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
         )
 
         while True:
@@ -594,8 +605,9 @@ def main() -> None:
 
                 connection = result_store.connection
 
-                # 상세 FAIL이 없으면 전체 SUCCESS
-                if result.fail_count == 0:
+                # 변경: 일부 대상 실패가 있어도 작업이 끝까지 완료되면 전체 SUCCESS로 처리한다.
+                # 단, 발송 제한 등으로 중간에 멈춘 경우는 전체 FAIL로 처리한다.
+                if not result.stopped_early:
                     final_status = "SUCCESS"
 
                     connection = mark_status_with_reconnect(
@@ -606,20 +618,6 @@ def main() -> None:
                         console_status=console_status,
                     )
 
-                # 성공과 실패가 섞였으면 PARTIAL_FAIL
-                elif result.success_count > 0:
-                    final_status = "PARTIAL_FAIL"
-
-                    connection = mark_status_with_reconnect(
-                        connection=connection,
-                        updater=mark_execution_partial_fail,
-                        hist_id=job.hist_id,
-                        logger=logger,
-                        console_status=console_status,
-                        error_message=build_job_error_message(result),
-                    )
-
-                # 성공 없이 모두 실패했으면 FAIL
                 else:
                     final_status = "FAIL"
 
@@ -663,15 +661,7 @@ def main() -> None:
             except Exception as error:
                 console_status.finish()
 
-                has_success_result = (
-                        result_store.updated_success_count > 0
-                )
-
-                final_status = (
-                    "PARTIAL_FAIL"
-                    if has_success_result
-                    else "FAIL"
-                )
+                final_status = "FAIL"
 
                 logger.exception(
                     "[JOB] %s | HIST_ID=%s | INSERT=%s | "
@@ -687,11 +677,7 @@ def main() -> None:
 
                 connection = mark_status_with_reconnect(
                     connection=connection,
-                    updater=(
-                        mark_execution_partial_fail
-                        if has_success_result
-                        else mark_execution_fail
-                    ),
+                    updater=mark_execution_fail,
                     hist_id=job.hist_id,
                     logger=logger,
                     console_status=console_status,

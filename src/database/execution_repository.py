@@ -114,24 +114,6 @@ def normalize_setting_data(data: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def first_setting_value(
-        data: Dict[str, Any],
-        *keys: str,
-) -> Any:
-    """여러 후보 키 중 값이 존재하는 첫 번째 값을 반환한다."""
-    for key in keys:
-        value = data.get(key)
-
-        if value is None:
-            continue
-
-        if isinstance(value, str) and not value.strip():
-            continue
-
-        return value
-
-    return None
-
 
 def parse_execution_setting(
         setting_json: str,
@@ -160,31 +142,8 @@ def parse_execution_setting(
         data.get("message_text", "")
     ).strip()
 
-    # login_id/login_password를 기본 코드로 사용한다.
-    # 기존 또는 다른 서버 키도 받을 수 있도록 안전하게 별칭을 지원한다.
-    login_id = str(
-        first_setting_value(
-            data,
-            "login_id",
-            "panda_id",
-            "account_id",
-            "id",
-            "user_id",
-        )
-        or ""
-    ).strip()
-
-    login_password = str(
-        first_setting_value(
-            data,
-            "login_password",
-            "panda_password",
-            "account_password",
-            "password",
-            "pw",
-        )
-        or ""
-    )
+    login_id = str(data.get("login_id") or "").strip()
+    login_password = str(data.get("login_password") or "")
 
     try:
         start_page = int(data.get("start_page"))

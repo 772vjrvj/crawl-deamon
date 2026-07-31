@@ -429,11 +429,11 @@ def post_form_with_browser(
 
         if isinstance(response_data, dict):
             error_message = (
-                    response_data.get("message")
+                response_data.get("message")
                     or json.dumps(
-                response_data,
-                ensure_ascii=False,
-            )
+                    response_data,
+                    ensure_ascii=False,
+                )
             )
         else:
             error_message = (
@@ -742,29 +742,6 @@ def insert_all_results_first(
     return prepared_results, skipped_count
 
 
-def generate_message(message_template: str) -> str:
-    """
-    DB의 message_text로 실제 발송 문구를 만든다.
-
-    - 문구에 @가 있으면 @를 [영문·숫자 4자리]로 치환
-    - @가 없으면 문구 끝에 [영문·숫자 4자리]를 추가
-    """
-    random_code = "".join(
-        random.choices(
-            string.ascii_letters + string.digits,
-            k=4,
-            )
-    )
-    random_suffix = f"[{random_code}]"
-
-    if "@" in message_template:
-        return message_template.replace(
-            "@",
-            random_suffix,
-        )
-
-    return f"{message_template} {random_suffix}".strip()
-
 
 def build_updated_result_data(
         prepared: PreparedResult,
@@ -888,12 +865,9 @@ def send_messages_after_insert(
             "",
         )
 
-        sent_message = generate_message(
-            job.setting.message_text
-        )
 
         payload = {
-            "message": sent_message,
+            "message": job.setting.message_text,
             "userIdx": user_idx,
         }
 
@@ -911,7 +885,7 @@ def send_messages_after_insert(
                 prepared=prepared,
                 status="SUCCESS",
                 result_message="메시지 발송에 성공했습니다.",
-                sent_message=sent_message,
+                sent_message=job.setting.message_text,
                 send_attempted_yn=True,
                 send_success_yn=True,
                 send_response=response_json,
@@ -943,7 +917,7 @@ def send_messages_after_insert(
                 prepared=prepared,
                 status="FAIL",
                 result_message="메시지 발송에 실패했습니다.",
-                sent_message=sent_message,
+                sent_message=job.setting.message_text,
                 send_attempted_yn=True,
                 send_success_yn=False,
                 send_response=None,

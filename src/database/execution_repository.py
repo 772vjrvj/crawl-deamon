@@ -45,6 +45,8 @@ class ExecutionSetting:
     end_page: int
     message_text: str
     exclude_duplicate_yn: bool
+    login_id: str
+    login_password: str
 
 
 @dataclass(frozen=True)
@@ -85,21 +87,70 @@ def normalize_boolean(value: Any) -> bool:
     return False
 
 
+def normalize_setting_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    일반 설정 JSON과 fields 배열 형태를 모두 동일한 dict로 변환한다.
+
+    지원 형식
+    1. {"ranking_type": "...", "login_id": "..."}
+    2. {"version": 1, "fields": [{"code": "ranking_type", "value": "..."}]}
+    """
+    normalized = dict(data)
+    fields = data.get("fields")
+
+    if not isinstance(fields, list):
+        return normalized
+
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+
+        code = str(field.get("code") or "").strip()
+        if not code:
+            continue
+
+        normalized[code] = field.get("value")
+
+    return normalized
+
+
+def first_setting_value(
+        data: Dict[str, Any],
+        *keys: str,
+) -> Any:
+    """여러 후보 키 중 값이 존재하는 첫 번째 값을 반환한다."""
+    for key in keys:
+        value = data.get(key)
+
+        if value is None:
+            continue
+
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        return value
+
+    return None
+
+
 def parse_execution_setting(
         setting_json: str,
 ) -> ExecutionSetting:
     """SETTING_JSON을 파싱하고 필수 설정을 검증한다."""
     try:
-        data = json.loads(setting_json)
+        loaded_data = json.loads(setting_json)
     except json.JSONDecodeError as error:
         raise ValueError(
             f"SETTING_JSON 형식이 올바르지 않습니다: {error}"
         ) from error
 
-    if not isinstance(data, dict):
+    if not isinstance(loaded_data, dict):
         raise ValueError(
             "SETTING_JSON의 최상위 값은 객체여야 합니다."
         )
+
+    # 변경: 사용자가 전달한 version/fields 형식도 바로 읽을 수 있다.
+    data = normalize_setting_data(loaded_data)
 
     ranking_type = str(
         data.get("ranking_type", "")
@@ -108,6 +159,32 @@ def parse_execution_setting(
     message_text = str(
         data.get("message_text", "")
     ).strip()
+
+    # login_id/login_password를 기본 코드로 사용한다.
+    # 기존 또는 다른 서버 키도 받을 수 있도록 안전하게 별칭을 지원한다.
+    login_id = str(
+        first_setting_value(
+            data,
+            "login_id",
+            "panda_id",
+            "account_id",
+            "id",
+            "user_id",
+        )
+        or ""
+    ).strip()
+
+    login_password = str(
+        first_setting_value(
+            data,
+            "login_password",
+            "panda_password",
+            "account_password",
+            "password",
+            "pw",
+        )
+        or ""
+    )
 
     try:
         start_page = int(data.get("start_page"))
@@ -137,6 +214,16 @@ def parse_execution_setting(
             "message_text 값이 없습니다."
         )
 
+    if not login_id:
+        raise ValueError(
+            "login_id 값이 없습니다."
+        )
+
+    if not login_password:
+        raise ValueError(
+            "login_password 값이 없습니다."
+        )
+
     return ExecutionSetting(
         ranking_type=ranking_type,
         start_page=start_page,
@@ -145,6 +232,8 @@ def parse_execution_setting(
         exclude_duplicate_yn=normalize_boolean(
             data.get("exclude_duplicate_yn")
         ),
+        login_id=login_id,
+        login_password=login_password,
     )
 
 
@@ -196,23 +285,23 @@ def insert_execution_result(
 ) -> int:
     """SERVICE_EXECUTION_RESULT에 상세 결과 한 건을 INSERT한다."""
     sql = """
-          INSERT INTO SERVICE_EXECUTION_RESULT
-          (
-              HIST_ID,
-              STATUS,
-              RESULT_JSON,
-              ERROR_MESSAGE,
-              PROCESSED_AT
-          )
-          VALUES
-              (
-                  %s,
-                  %s,
-                  %s,
-                  %s,
-                  %s
-              ) \
-          """
+        INSERT INTO SERVICE_EXECUTION_RESULT
+        (
+            HIST_ID,
+            STATUS,
+            RESULT_JSON,
+            ERROR_MESSAGE,
+            PROCESSED_AT
+        )
+        VALUES
+        (
+            %s,
+            %s,
+            %s,
+            %s,
+            %s
+        )
+    """
 
     try:
         with connection.cursor() as cursor:
@@ -243,17 +332,15 @@ def update_execution_result(
         result_data: Dict[str, Any],
         error_message: Optional[str] = None,
 ) -> bool:
-    """
-    먼저 INSERT된 READY 상세 결과를 SUCCESS / FAIL 등으로 변경한다.
-    """
+    """먼저 INSERT된 READY 상세 결과를 SUCCESS / FAIL 등으로 변경한다."""
     sql = """
-          UPDATE SERVICE_EXECUTION_RESULT
-          SET STATUS = %s,
-              RESULT_JSON = %s,
-              ERROR_MESSAGE = %s,
-              PROCESSED_AT = %s
-          WHERE RESULT_ID = %s \
-          """
+        UPDATE SERVICE_EXECUTION_RESULT
+        SET STATUS = %s,
+            RESULT_JSON = %s,
+            ERROR_MESSAGE = %s,
+            PROCESSED_AT = %s
+        WHERE RESULT_ID = %s
+    """
 
     try:
         with connection.cursor() as cursor:
@@ -283,13 +370,13 @@ def mark_execution_success(
 ) -> bool:
     """RUNNING 실행 이력을 SUCCESS로 변경한다."""
     sql = """
-          UPDATE SERVICE_EXECUTION_HIST
-          SET STATUS = 'SUCCESS',
-              END_AT = %s,
-              ERROR_MESSAGE = NULL
-          WHERE HIST_ID = %s
-            AND STATUS = 'RUNNING' \
-          """
+        UPDATE SERVICE_EXECUTION_HIST
+        SET STATUS = 'SUCCESS',
+            END_AT = %s,
+            ERROR_MESSAGE = NULL
+        WHERE HIST_ID = %s
+          AND STATUS = 'RUNNING'
+    """
 
     try:
         with connection.cursor() as cursor:
@@ -317,13 +404,13 @@ def mark_execution_partial_fail(
 ) -> bool:
     """RUNNING 실행 이력을 PARTIAL_FAIL로 변경한다."""
     sql = """
-          UPDATE SERVICE_EXECUTION_HIST
-          SET STATUS = 'PARTIAL_FAIL',
-              END_AT = %s,
-              ERROR_MESSAGE = %s
-          WHERE HIST_ID = %s
-            AND STATUS = 'RUNNING' \
-          """
+        UPDATE SERVICE_EXECUTION_HIST
+        SET STATUS = 'PARTIAL_FAIL',
+            END_AT = %s,
+            ERROR_MESSAGE = %s
+        WHERE HIST_ID = %s
+          AND STATUS = 'RUNNING'
+    """
 
     try:
         with connection.cursor() as cursor:
@@ -352,13 +439,13 @@ def mark_execution_fail(
 ) -> bool:
     """RUNNING 실행 이력을 FAIL로 변경한다."""
     sql = """
-          UPDATE SERVICE_EXECUTION_HIST
-          SET STATUS = 'FAIL',
-              END_AT = %s,
-              ERROR_MESSAGE = %s
-          WHERE HIST_ID = %s
-            AND STATUS = 'RUNNING' \
-          """
+        UPDATE SERVICE_EXECUTION_HIST
+        SET STATUS = 'FAIL',
+            END_AT = %s,
+            ERROR_MESSAGE = %s
+        WHERE HIST_ID = %s
+          AND STATUS = 'RUNNING'
+    """
 
     try:
         with connection.cursor() as cursor:
@@ -387,20 +474,20 @@ def claim_next_ready_execution(
     current_time = current_datetime_text()
 
     select_sql = """
-                 SELECT
-                     HIST_ID,
-                     USER_SERVICE_ID,
-                     STATUS,
-                     SCHEDULED_AT,
-                     SETTING_JSON
-                 FROM SERVICE_EXECUTION_HIST
-                 WHERE STATUS = 'READY'
-                   AND SCHEDULED_AT <= %s
-                 ORDER BY
-                     SCHEDULED_AT ASC,
-                     HIST_ID ASC
-                 LIMIT 1 \
-                 """
+        SELECT
+            HIST_ID,
+            USER_SERVICE_ID,
+            STATUS,
+            SCHEDULED_AT,
+            SETTING_JSON
+        FROM SERVICE_EXECUTION_HIST
+        WHERE STATUS = 'READY'
+          AND SCHEDULED_AT <= %s
+        ORDER BY
+            SCHEDULED_AT ASC,
+            HIST_ID ASC
+        LIMIT 1
+    """
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -415,15 +502,15 @@ def claim_next_ready_execution(
     hist_id = int(row["HIST_ID"])
 
     update_sql = """
-                 UPDATE SERVICE_EXECUTION_HIST
-                 SET STATUS = 'RUNNING',
-                     START_AT = %s,
-                     END_AT = NULL,
-                     ERROR_MESSAGE = NULL
-                 WHERE HIST_ID = %s
-                   AND STATUS = 'READY'
-                   AND SCHEDULED_AT <= %s \
-                 """
+        UPDATE SERVICE_EXECUTION_HIST
+        SET STATUS = 'RUNNING',
+            START_AT = %s,
+            END_AT = NULL,
+            ERROR_MESSAGE = NULL
+        WHERE HIST_ID = %s
+          AND STATUS = 'READY'
+          AND SCHEDULED_AT <= %s
+    """
 
     try:
         with connection.cursor() as cursor:

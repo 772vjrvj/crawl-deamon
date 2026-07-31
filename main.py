@@ -3,18 +3,15 @@
 crawl-deamon 메인 실행 파일
 
 실행 흐름
-1. MariaDB 연결
-2. Selenium Chrome 실행
-3. 팬더라이브 수동 로그인
-4. READY 작업을 RUNNING으로 선점
-5. 랭킹 데이터를 실제 조회
-6. 모든 대상 결과를 SERVICE_EXECUTION_RESULT에 먼저 INSERT
-   - 발송 대상: READY
-   - userIdx 없음: SKIP
-7. INSERT가 전부 완료된 뒤 메시지 발송 단계 시작
-8. 대상별 실제 메시지 발송 후 READY를 SUCCESS / FAIL로 업데이트
-9. 전체 발송 결과에 따라 실행 이력을 SUCCESS / PARTIAL_FAIL / FAIL로 업데이트
-10. 브라우저 새로고침 후 다음 작업 대기
+1. MariaDB 연결 후 READY 작업 대기
+2. READY 작업을 RUNNING으로 선점
+3. 작업마다 새 Chrome 브라우저 실행
+4. SETTING_JSON의 아이디/비밀번호로 팬더라이브 자동 로그인
+5. 랭킹 조회 및 상세 결과 선INSERT
+6. 대상별 실제 메시지 발송
+7. 실행 이력을 SUCCESS / PARTIAL_FAIL / FAIL로 변경
+8. 작업 완료 여부와 관계없이 브라우저 종료
+9. 데몬은 브라우저 없이 다음 READY 작업 대기
 """
 
 import time
@@ -24,7 +21,6 @@ from typing import Any, Callable, Dict, Optional
 
 import pymysql
 from pymysql.connections import Connection
-from selenium.webdriver.remote.webdriver import WebDriver
 
 from src.database.db_connection import create_connection
 from src.database.execution_repository import (
@@ -45,21 +41,15 @@ from src.utils.selenium_utils import SeleniumUtils
 from src.workers.panda_worker import (
     MessageExecutionResult,
     execute_message_job,
-    is_panda_logged_out,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOG_DIR = PROJECT_ROOT / "logs"
 
-PANDA_LIVE_URL = "https://www.pandalive.co.kr/"
-PANDA_WAIT_URL = "https://www.pandalive.co.kr/ranking/rankingPersonalBJ"
-
 JOB_POLL_INTERVAL_SEC = 5
 DB_RECONNECT_INTERVAL_SEC = 10
 FILE_HEARTBEAT_INTERVAL_SEC = 300
-BROWSER_REFRESH_INTERVAL_SEC = 300
-
 LOG_CLEANUP_INTERVAL_SEC = 24 * 60 * 60
 LOG_RETENTION_DAYS = 30
 
@@ -150,101 +140,6 @@ def ensure_database_connection(
     )
 
 
-def wait_for_manual_login() -> None:
-    """브라우저에서 로그인한 뒤 콘솔 Enter 입력을 기다린다."""
-    print()
-    print("=" * 70)
-    print("[LOGIN] 브라우저에서 팬더라이브 로그인을 완료해 주세요.")
-    print("[LOGIN] 로그인 완료 후 이 콘솔에서 Enter 키를 눌러 주세요.")
-    print("=" * 70)
-    input()
-
-
-def move_to_wait_page(
-        driver: WebDriver,
-        selenium_utils: SeleniumUtils,
-) -> None:
-    """로그인 후 기본 대기 랭킹 페이지로 이동한다."""
-    print()
-    print("[PANDA] 개인 BJ 랭킹 페이지로 이동합니다.")
-
-    driver.get(PANDA_WAIT_URL)
-    selenium_utils.wait_ready_state_complete(timeout_sec=15)
-
-    print(f"[PANDA] 현재 URL: {driver.current_url}")
-    print(f"[PANDA] 현재 제목: {driver.title}")
-    print("[PANDA] 개인 BJ 랭킹 페이지 이동 성공")
-
-
-def ensure_login_session(
-        driver: WebDriver,
-        selenium_utils: SeleniumUtils,
-        logger,
-        console_status: ConsoleStatus,
-        reason: str,
-) -> None:
-    """
-    '로그인 / 회원가입' 문구가 보이면 재로그인을 기다린다.
-
-    로그아웃 상태에서는 READY 작업을 가져오지 않는다.
-    """
-    while is_panda_logged_out(driver):
-        console_status.finish()
-
-        logger.warning(
-            "[LOGIN] 로그아웃 상태를 감지했습니다. | reason=%s",
-            reason,
-        )
-
-        print()
-        print("=" * 70)
-        print("[LOGIN] 팬더티비 로그인이 풀렸습니다.")
-        print("[LOGIN] 브라우저에서 다시 로그인해 주세요.")
-        print("[LOGIN] 로그인 완료 후 이 콘솔에서 Enter 키를 눌러 주세요.")
-        print("=" * 70)
-        input()
-
-        driver.get(PANDA_WAIT_URL)
-        selenium_utils.wait_ready_state_complete(timeout_sec=15)
-
-        if is_panda_logged_out(driver):
-            logger.warning(
-                "[LOGIN] 아직 '로그인 / 회원가입' 문구가 보입니다."
-            )
-            continue
-
-        logger.info(
-            "[LOGIN] 팬더티비 로그인 상태가 다시 확인되었습니다."
-        )
-
-
-def refresh_browser(
-        driver: WebDriver,
-        selenium_utils: SeleniumUtils,
-        logger,
-        console_status: ConsoleStatus,
-        reason: str,
-) -> None:
-    """현재 페이지를 새로고침하고 로그인 상태를 확인한다."""
-    console_status.finish()
-    logger.info("[PANDA] 브라우저 새로고침: %s", reason)
-
-    driver.refresh()
-    selenium_utils.wait_ready_state_complete(timeout_sec=15)
-
-    logger.info(
-        "[PANDA] 새로고침 완료 | URL=%s",
-        driver.current_url,
-    )
-
-    ensure_login_session(
-        driver=driver,
-        selenium_utils=selenium_utils,
-        logger=logger,
-        console_status=console_status,
-        reason=f"브라우저 새로고침 후: {reason}",
-    )
-
 
 def cleanup_logs_if_due(
         next_cleanup_at: float,
@@ -295,6 +190,7 @@ def print_claimed_job(
         "exclude_duplicate_yn=%s",
         job.setting.exclude_duplicate_yn,
     )
+    logger.info("login_id=%s", job.setting.login_id)
     logger.info("=" * 70)
 
 
@@ -550,7 +446,7 @@ def log_job_result(
 
 
 def main() -> None:
-    """crawl-deamon을 실행한다."""
+    """브라우저 없이 대기하고, 작업이 있을 때만 Chrome을 실행한다."""
     logger = setup_logger(
         project_root=PROJECT_ROOT,
         retention_days=LOG_RETENTION_DAYS,
@@ -558,13 +454,6 @@ def main() -> None:
     console_status = ConsoleStatus()
 
     connection: Optional[Connection] = None
-    driver: Optional[WebDriver] = None
-
-    selenium_utils = SeleniumUtils(
-        headless=False,
-        debug=True,
-        log_func=lambda message: logger.info(message),
-    )
 
     try:
         logger.info("=" * 70)
@@ -576,60 +465,20 @@ def main() -> None:
             console_status=console_status,
         )
 
-        logger.info("[SELENIUM] Chrome 브라우저를 실행합니다.")
-
-        driver = selenium_utils.start_driver(
-            timeout=30,
-            view_mode="browser",
-            window_size=(1200, 900),
-        )
-
-        logger.info("[SELENIUM] Chrome 브라우저 실행 성공")
-        logger.info("[PANDA] 팬더라이브에 접속합니다.")
-
-        driver.get(PANDA_LIVE_URL)
-        selenium_utils.wait_ready_state_complete(timeout_sec=15)
-
-        logger.info(
-            "[PANDA] 접속 완료 | URL=%s | TITLE=%s",
-            driver.current_url,
-            driver.title,
-        )
-
-        wait_for_manual_login()
-        logger.info("[LOGIN] 로그인 완료 입력을 확인했습니다.")
-
-        move_to_wait_page(
-            driver=driver,
-            selenium_utils=selenium_utils,
-        )
-
-        ensure_login_session(
-            driver=driver,
-            selenium_utils=selenium_utils,
-            logger=logger,
-            console_status=console_status,
-            reason="데몬 초기 로그인 확인",
-        )
-
         logger.info(
             "[QUEUE] %s초마다 READY 작업을 확인합니다.",
             JOB_POLL_INTERVAL_SEC,
         )
         logger.info(
-            "[MESSAGE] 실제 메시지 발송 기능이 활성화되어 있습니다."
+            "[BROWSER] READY 작업이 있을 때만 Chrome을 실행합니다."
         )
         logger.info(
-            "[RESULT] 모든 발송 대상을 READY로 먼저 INSERT한 뒤 "
-            "실제 쪽지 발송을 시작합니다."
+            "[BROWSER] 작업이 끝나면 Chrome을 종료하고 데몬만 대기합니다."
         )
         logger.info("[DAEMON] 종료하려면 Ctrl+C를 누르세요.")
 
         next_file_heartbeat_at = (
                 time.monotonic() + FILE_HEARTBEAT_INTERVAL_SEC
-        )
-        next_browser_refresh_at = (
-                time.monotonic() + BROWSER_REFRESH_INTERVAL_SEC
         )
         next_log_cleanup_at = (
                 time.monotonic() + LOG_CLEANUP_INTERVAL_SEC
@@ -640,14 +489,6 @@ def main() -> None:
                 connection=connection,
                 logger=logger,
                 console_status=console_status,
-            )
-
-            ensure_login_session(
-                driver=driver,
-                selenium_utils=selenium_utils,
-                logger=logger,
-                console_status=console_status,
-                reason="DB 작업 조회 전",
             )
 
             try:
@@ -695,19 +536,6 @@ def main() -> None:
                             now_monotonic + FILE_HEARTBEAT_INTERVAL_SEC
                     )
 
-                if now_monotonic >= next_browser_refresh_at:
-                    refresh_browser(
-                        driver=driver,
-                        selenium_utils=selenium_utils,
-                        logger=logger,
-                        console_status=console_status,
-                        reason="유휴 상태 로그인 세션 유지",
-                    )
-                    next_browser_refresh_at = (
-                            time.monotonic()
-                            + BROWSER_REFRESH_INTERVAL_SEC
-                    )
-
                 next_log_cleanup_at = cleanup_logs_if_due(
                     next_cleanup_at=next_log_cleanup_at,
                     logger=logger,
@@ -730,15 +558,31 @@ def main() -> None:
                 console_status=console_status,
             )
 
+            # 변경: 브라우저와 SeleniumUtils를 작업마다 새로 생성한다.
+            selenium_utils = SeleniumUtils(
+                headless=False,
+                debug=True,
+                log_func=lambda message: logger.info(message),
+            )
+
             try:
-                ensure_login_session(
-                    driver=driver,
-                    selenium_utils=selenium_utils,
-                    logger=logger,
-                    console_status=console_status,
-                    reason=f"HIST_ID={job.hist_id} 작업 실행 직전",
+                logger.info(
+                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 실행합니다.",
+                    job.hist_id,
                 )
 
+                driver = selenium_utils.start_driver(
+                    timeout=30,
+                    view_mode="browser",
+                    window_size=(1200, 900),
+                )
+
+                logger.info(
+                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저 실행 성공",
+                    job.hist_id,
+                )
+
+                # execute_message_job 내부에서 자동 로그인 후 기존 작업을 진행한다.
                 result = execute_message_job(
                     driver=driver,
                     selenium_utils=selenium_utils,
@@ -795,6 +639,27 @@ def main() -> None:
                     logger=logger,
                 )
 
+            except KeyboardInterrupt:
+                console_status.finish()
+                connection = result_store.connection
+
+                try:
+                    connection = mark_status_with_reconnect(
+                        connection=connection,
+                        updater=mark_execution_fail,
+                        hist_id=job.hist_id,
+                        logger=logger,
+                        console_status=console_status,
+                        error_message="사용자가 Ctrl+C로 작업을 중단했습니다.",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[JOB] HIST_ID=%s 사용자 중단 상태 저장 실패",
+                        job.hist_id,
+                    )
+
+                raise
+
             except Exception as error:
                 console_status.finish()
 
@@ -834,24 +699,13 @@ def main() -> None:
                 )
 
             finally:
-                try:
-                    refresh_browser(
-                        driver=driver,
-                        selenium_utils=selenium_utils,
-                        logger=logger,
-                        console_status=console_status,
-                        reason=f"HIST_ID={job.hist_id} 작업 종료",
-                    )
-                except Exception as refresh_error:
-                    logger.exception(
-                        "[PANDA] 작업 후 새로고침 실패: %s",
-                        refresh_error,
-                    )
-
-                next_browser_refresh_at = (
-                        time.monotonic()
-                        + BROWSER_REFRESH_INTERVAL_SEC
+                # 변경: 성공/실패와 관계없이 작업이 끝나면 브라우저를 종료한다.
+                selenium_utils.quit()
+                logger.info(
+                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 종료했습니다.",
+                    job.hist_id,
                 )
+
 
                 next_log_cleanup_at = cleanup_logs_if_due(
                     next_cleanup_at=next_log_cleanup_at,
@@ -873,9 +727,6 @@ def main() -> None:
 
     finally:
         console_status.finish()
-
-        selenium_utils.quit()
-        logger.info("[SELENIUM] Chrome 브라우저를 종료했습니다.")
 
         close_database_connection(connection)
         logger.info("[DB] MariaDB 연결을 종료했습니다.")

@@ -20,8 +20,12 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlencode
 
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 from src.database.execution_repository import ExecutionJob
 from src.utils.selenium_utils import SeleniumUtils
@@ -30,8 +34,15 @@ from src.utils.selenium_utils import SeleniumUtils
 RANKING_API_URL = "https://api.pandalive.co.kr/v1/live/cache"
 SEND_MESSAGE_API_URL = "https://api.pandalive.co.kr/v1/post/send_message"
 
+PANDA_LIVE_URL = "https://www.pandalive.co.kr/"
+
 LOGIN_BUTTON_TEXT = "로그인 / 회원가입"
 MESSAGE_LIMIT_TEXT = "쪽지 전송이 제한되었습니다"
+
+# 자동 로그인 대기 시간
+AD_POPUP_WAIT_SEC = 3
+LOGIN_ELEMENT_WAIT_SEC = 10
+LOGIN_RESULT_WAIT_SEC = 20
 
 PAGE_SIZE = 20
 
@@ -88,21 +99,254 @@ ResultUpdater = Callable[
 ]
 
 
+
+def _visible_elements(
+        driver: WebDriver,
+        xpath: str,
+) -> List[Any]:
+    """XPath와 일치하는 요소 중 화면에 보이는 요소만 반환한다."""
+    return [
+        element
+        for element in driver.find_elements(By.XPATH, xpath)
+        if element.is_displayed()
+    ]
+
+
+def _click_element(driver: WebDriver, element: Any) -> None:
+    """일반 클릭이 막히면 JavaScript 클릭으로 한 번 더 시도한다."""
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script(
+            "arguments[0].click();",
+            element,
+        )
+
+
+def close_ad_popup_if_present(
+        driver: WebDriver,
+        logger,
+) -> None:
+    """
+    메인 접속 후 광고 팝업의 닫기 버튼을 최대 3초 동안 찾는다.
+
+    광고가 없으면 3초 대기 후 로그인 단계를 계속한다.
+    """
+    close_xpath = (
+        "//*[@data-modal='useBannerViewModel']"
+        "//button[normalize-space(.)='닫기']"
+    )
+
+    try:
+        close_button = WebDriverWait(
+            driver,
+            AD_POPUP_WAIT_SEC,
+        ).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, close_xpath)
+            )
+        )
+
+        _click_element(driver, close_button)
+
+        try:
+            WebDriverWait(driver, 3).until(
+                EC.invisibility_of_element_located(
+                    (By.XPATH, close_xpath)
+                )
+            )
+        except TimeoutException:
+            pass
+
+        logger.info("[LOGIN] 광고 팝업을 닫았습니다.")
+
+    except TimeoutException:
+        logger.info(
+            "[LOGIN] 광고 팝업이 없어 %s초 대기 후 로그인을 진행합니다.",
+            AD_POPUP_WAIT_SEC,
+        )
+
+
+def click_login_entry(driver: WebDriver, logger) -> None:
+    """로그인/회원가입 영역과 이어서 나타나는 로그인 버튼을 누른다."""
+    login_entry_xpath = (
+        "//*[self::div or self::button]"
+        "[normalize-space(.)='로그인 / 회원가입']"
+    )
+
+    login_entry = WebDriverWait(
+        driver,
+        LOGIN_ELEMENT_WAIT_SEC,
+    ).until(
+        EC.element_to_be_clickable(
+            (By.XPATH, login_entry_xpath)
+        )
+    )
+
+    _click_element(driver, login_entry)
+    logger.info("[LOGIN] 로그인 / 회원가입 버튼을 클릭했습니다.")
+
+    tooltip_login_xpath = (
+        "//button[@type='button' and not(@role='tab') "
+        "and normalize-space(.)='로그인']"
+    )
+    login_tab_xpath = (
+        "//button[@role='tab' and .//p[normalize-space(.)='로그인']]"
+    )
+
+    try:
+        tooltip_login = WebDriverWait(
+            driver,
+            5,
+        ).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, tooltip_login_xpath)
+            )
+        )
+
+        _click_element(driver, tooltip_login)
+        logger.info("[LOGIN] 툴팁 로그인 버튼을 클릭했습니다.")
+
+    except TimeoutException:
+        # 사이트 상태에 따라 툴팁 없이 로그인 모달이 바로 열릴 수 있다.
+        if not _visible_elements(driver, login_tab_xpath):
+            raise RuntimeError(
+                "툴팁 로그인 버튼 또는 로그인 모달을 찾지 못했습니다."
+            )
+
+        logger.info("[LOGIN] 로그인 모달이 바로 열렸습니다.")
+
+    login_tab = WebDriverWait(
+        driver,
+        LOGIN_ELEMENT_WAIT_SEC,
+    ).until(
+        EC.element_to_be_clickable(
+            (By.XPATH, login_tab_xpath)
+        )
+    )
+
+    _click_element(driver, login_tab)
+    logger.info("[LOGIN] 로그인 탭을 클릭했습니다.")
+
+
+def fill_login_form(
+        driver: WebDriver,
+        login_id: str,
+        login_password: str,
+        logger,
+) -> None:
+    """작업 설정의 아이디와 비밀번호를 입력하고 로그인한다."""
+    id_input = WebDriverWait(
+        driver,
+        LOGIN_ELEMENT_WAIT_SEC,
+    ).until(
+        EC.visibility_of_element_located(
+            (By.ID, "id")
+        )
+    )
+
+    password_input = WebDriverWait(
+        driver,
+        LOGIN_ELEMENT_WAIT_SEC,
+    ).until(
+        EC.visibility_of_element_located(
+            (By.NAME, "pw")
+        )
+    )
+
+    id_input.click()
+    id_input.send_keys(Keys.CONTROL, "a")
+    id_input.send_keys(login_id)
+
+    password_input.click()
+    password_input.send_keys(Keys.CONTROL, "a")
+    password_input.send_keys(login_password)
+
+    login_button = WebDriverWait(
+        driver,
+        LOGIN_ELEMENT_WAIT_SEC,
+    ).until(
+        EC.element_to_be_clickable(
+            (By.ID, "login-button")
+        )
+    )
+
+    _click_element(driver, login_button)
+    logger.info("[LOGIN] 아이디와 비밀번호를 입력하고 로그인 버튼을 클릭했습니다.")
+
+
+def login_panda(
+        driver: WebDriver,
+        selenium_utils: SeleniumUtils,
+        login_id: str,
+        login_password: str,
+        logger,
+) -> None:
+    """팬더라이브 접속부터 자동 로그인 완료 확인까지 처리한다."""
+    logger.info("[PANDA] 팬더라이브에 접속합니다.")
+
+    driver.get(PANDA_LIVE_URL)
+    selenium_utils.wait_ready_state_complete(
+        timeout_sec=15,
+    )
+
+    logger.info(
+        "[PANDA] 접속 완료 | URL=%s | TITLE=%s",
+        driver.current_url,
+        driver.title,
+    )
+
+    close_ad_popup_if_present(
+        driver=driver,
+        logger=logger,
+    )
+
+    click_login_entry(
+        driver=driver,
+        logger=logger,
+    )
+
+    fill_login_form(
+        driver=driver,
+        login_id=login_id,
+        login_password=login_password,
+        logger=logger,
+    )
+
+    try:
+        WebDriverWait(
+            driver,
+            LOGIN_RESULT_WAIT_SEC,
+        ).until(
+            lambda current_driver: not is_panda_logged_out(
+                current_driver
+            )
+        )
+
+    except TimeoutException as error:
+        raise RuntimeError(
+            "팬더라이브 로그인 완료를 확인하지 못했습니다. "
+            "아이디 또는 비밀번호를 확인해 주세요."
+        ) from error
+
+    logger.info(
+        "[LOGIN] 팬더라이브 자동 로그인 성공 | login_id=%s",
+        login_id,
+    )
+
 def is_panda_logged_out(driver: WebDriver) -> bool:
-    """'로그인 / 회원가입' 문구가 보이면 로그아웃으로 판단한다."""
-    login_buttons = driver.find_elements(
+    """화면에 '로그인 / 회원가입' 영역이 보이면 로그아웃으로 판단한다."""
+    login_elements = driver.find_elements(
         By.XPATH,
         (
-            "//button["
-            "normalize-space(.)='로그인 / 회원가입' "
-            "or .//*[normalize-space(.)='로그인 / 회원가입']"
-            "]"
+            "//*[self::div or self::button]"
+            "[normalize-space(.)='로그인 / 회원가입']"
         ),
     )
 
     return any(
-        button.is_displayed()
-        for button in login_buttons
+        element.is_displayed()
+        for element in login_elements
     )
 
 
@@ -797,7 +1041,16 @@ def execute_message_job(
         result_inserter: ResultInserter,
         result_updater: ResultUpdater,
 ) -> MessageExecutionResult:
-    """랭킹 조회 → 전체 선INSERT → 실제 쪽지 발송 순서로 실행한다."""
+    """자동 로그인 → 랭킹 조회 → 선INSERT → 실제 발송 순서로 실행한다."""
+    # 변경: 작업마다 SETTING_JSON의 계정으로 새로 로그인한다.
+    login_panda(
+        driver=driver,
+        selenium_utils=selenium_utils,
+        login_id=job.setting.login_id,
+        login_password=job.setting.login_password,
+        logger=logger,
+    )
+
     move_to_job_ranking_page(
         driver=driver,
         selenium_utils=selenium_utils,

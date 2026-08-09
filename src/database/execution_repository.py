@@ -505,57 +505,48 @@ def select_existing_store_names(
         connection: Connection,
         user_service_id: int,
 ) -> Set[str]:
-    """
-    같은 USER_SERVICE_ID의 과거 SUCCESS 결과를 조회하고,
-    RESULT_JSON의 store_name을 Python에서 추출한다.
+    """같은 고객 서비스의 과거 SUCCESS 결과에서 스토어명을 조회한다.
 
-    구버전 MariaDB 호환을 위해 JSON_EXTRACT,
-    JSON_UNQUOTE 등의 DB JSON 함수는 사용하지 않는다.
+    구형 MariaDB에는 JSON_EXTRACT/JSON_UNQUOTE가 없을 수 있으므로
+    RESULT_JSON 원문만 조회하고 Python json 모듈로 파싱한다.
     """
     sql = """
-          SELECT
-              R.RESULT_JSON
-          FROM SERVICE_EXECUTION_RESULT R
-                   INNER JOIN SERVICE_EXECUTION_HIST H
-                              ON H.HIST_ID = R.HIST_ID
-          WHERE H.USER_SERVICE_ID = %s
-            AND R.STATUS = 'SUCCESS'
-            AND R.RESULT_JSON IS NOT NULL
-            AND TRIM(R.RESULT_JSON) <> '' \
-          """
+        SELECT R.RESULT_JSON
+        FROM SERVICE_EXECUTION_RESULT R
+        INNER JOIN SERVICE_EXECUTION_HIST H
+            ON H.HIST_ID = R.HIST_ID
+        WHERE H.USER_SERVICE_ID = %s
+          AND R.STATUS = 'SUCCESS'
+    """
 
     with connection.cursor() as cursor:
-        cursor.execute(
-            sql,
-            (user_service_id,),
-        )
+        cursor.execute(sql, (user_service_id,))
         rows = cursor.fetchall()
 
     store_names: Set[str] = set()
 
     for row in rows:
-        result_json = row.get("RESULT_JSON")
-
-        if not result_json:
+        raw_result = row.get("RESULT_JSON")
+        if not raw_result:
             continue
 
         try:
-            result_data = json.loads(result_json)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            result_data = (
+                raw_result
+                if isinstance(raw_result, dict)
+                else json.loads(str(raw_result))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
             continue
 
         if not isinstance(result_data, dict):
             continue
 
-        store_name = str(
-            result_data.get("store_name") or ""
-        ).strip()
-
+        store_name = str(result_data.get("store_name") or "").strip()
         if store_name:
             store_names.add(store_name)
 
     return store_names
-
 
 
 def claim_next_ready_execution(

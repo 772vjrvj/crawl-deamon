@@ -13,6 +13,7 @@ crawl-deamon 메인 실행 파일
 9. 데몬은 브라우저 없이 다음 READY 작업 대기
 """
 
+import os
 import sys
 import time
 from datetime import datetime, timedelta
@@ -55,6 +56,24 @@ JOB_POLL_INTERVAL_SEC = 5
 DB_RECONNECT_INTERVAL_SEC = 10
 FILE_HEARTBEAT_INTERVAL_SEC = 300
 LOG_RETENTION_DAYS = 30
+
+
+def get_env_bool(name: str, default: bool) -> bool:
+    """.env의 boolean 값을 엄격하게 읽는다."""
+    raw_value = os.getenv(name)
+
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "y", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "n", "no", "off"}:
+        return False
+
+    raise RuntimeError(
+        f".env의 {name} 값은 true 또는 false여야 합니다: {raw_value}"
+    )
 
 
 def check_database_connection(connection: Connection) -> None:
@@ -510,10 +529,24 @@ def main() -> None:
         service_code = get_required_env("DAEMON_SERVICE_CODE").upper()
         # 시작 시 잘못된 서비스 코드를 즉시 확인한다.
         selenium_required = requires_selenium(service_code)
+        selenium_headless = get_env_bool(
+            "SELENIUM_HEADLESS",
+            default=True,
+        )
 
         logger.info("=" * 70)
         logger.info("[DAEMON] crawl-deamon을 시작합니다.")
         logger.info("[DAEMON] 담당 SERVICE_CODE=%s", service_code)
+        if selenium_required:
+            logger.info(
+                "[SELENIUM] HEADLESS=%s",
+                str(selenium_headless).lower(),
+            )
+        else:
+            logger.info(
+                "[BROWSER] SELENIUM_HEADLESS는 적용하지 않습니다. "
+                "Worker가 일반 Chrome을 직접 제어합니다."
+            )
         logger.info("=" * 70)
 
         connection = connect_database_until_success(
@@ -632,14 +665,16 @@ def main() -> None:
                     from src.utils.selenium_utils import SeleniumUtils
 
                     selenium_utils = SeleniumUtils(
-                        headless=False,
+                        headless=selenium_headless,
                         debug=True,
                         log_func=lambda message: logger.info(message),
                     )
 
                     logger.info(
-                        "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 실행합니다.",
+                        "[SELENIUM] HIST_ID=%s | Chrome을 실행합니다. "
+                        "| HEADLESS=%s",
                         job.hist_id,
+                        str(selenium_headless).lower(),
                     )
                     driver = selenium_utils.start_driver(
                         timeout=30,

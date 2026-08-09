@@ -1,2 +1,9 @@
 PyMySQL==1.2.0
 python-dotenv==1.2.2
+pyinstaller
+selenium
+undetected-chromedriver
+PyAudioWPatch
+PyAutoGUI
+pyperclip
+openai-whisper

@@ -8,6 +8,7 @@ MariaDB 연결 관리
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -21,7 +22,11 @@ from dotenv import load_dotenv
 #
 # 프로젝트 최상위:
 # E:\git\crawl-deamon
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parents[2]
+)
 
 # 프로젝트 최상위의 .env 파일을 읽는다.
 load_dotenv(PROJECT_ROOT / ".env")

@@ -5,15 +5,15 @@ crawl-deamon 메인 실행 파일
 실행 흐름
 1. MariaDB 연결 후 READY 작업 대기
 2. READY 작업을 RUNNING으로 선점
-3. 작업마다 새 Chrome 브라우저 실행
-4. SETTING_JSON의 아이디/비밀번호로 팬더라이브 자동 로그인
-5. 랭킹 조회 및 상세 결과 선INSERT
-6. 대상별 실제 메시지 발송
+3. .env의 DAEMON_SERVICE_CODE와 일치하는 작업만 선점
+4. 서비스 코드에 맞는 Worker 실행
+5. 상세 결과를 공통 결과 테이블에 저장
 7. 실행 이력을 SUCCESS / FAIL로 변경
 8. 작업 완료 여부와 관계없이 브라우저 종료
 9. 데몬은 브라우저 없이 다음 READY 작업 대기
 """
 
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,13 +22,14 @@ from typing import Any, Callable, Dict, Optional
 import pymysql
 from pymysql.connections import Connection
 
-from src.database.db_connection import create_connection
+from src.database.db_connection import create_connection, get_required_env
 from src.database.execution_repository import (
     ExecutionJob,
     claim_next_ready_execution,
     insert_execution_result,
     mark_execution_fail,
     mark_execution_success,
+    select_existing_store_names,
     update_execution_result,
 )
 from src.utils.daemon_logger import (
@@ -36,14 +37,18 @@ from src.utils.daemon_logger import (
     cleanup_old_logs,
     setup_logger,
 )
-from src.utils.selenium_utils import SeleniumUtils
-from src.workers.panda_worker import (
-    MessageExecutionResult,
-    execute_message_job,
+from src.workers.worker_registry import (
+    WorkerExecutionResult,
+    execute_registered_worker,
+    requires_selenium,
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 LOG_DIR = PROJECT_ROOT / "logs"
 
 JOB_POLL_INTERVAL_SEC = 5
@@ -184,18 +189,32 @@ def print_claimed_job(
     logger.info("[QUEUE] 실행 작업을 RUNNING으로 선점했습니다.")
     logger.info("HIST_ID=%s", job.hist_id)
     logger.info("USER_SERVICE_ID=%s", job.user_service_id)
+    logger.info("SERVICE_CODE=%s", job.service_code)
     logger.info("SCHEDULED_AT=%s", job.scheduled_at)
-    logger.info("ranking_type=%s", job.setting.ranking_type)
     logger.info(
         "page_range=%s~%s",
         job.setting.start_page,
         job.setting.end_page,
     )
-    logger.info(
-        "exclude_duplicate_yn=%s",
-        job.setting.exclude_duplicate_yn,
-    )
-    logger.info("login_id=%s", job.setting.login_id)
+
+    if job.service_code == "PANDA_MESSAGE":
+        logger.info("ranking_type=%s", job.setting.ranking_type)
+        logger.info(
+            "exclude_duplicate_yn=%s",
+            job.setting.exclude_duplicate_yn,
+        )
+        logger.info("login_id=%s", job.setting.login_id)
+    elif job.service_code == "NAVER_SHOP_TOTAL_DETAIL":
+        keyword_count = len([
+            value
+            for value in job.setting.keyword.split(",")
+            if value.strip()
+        ])
+        logger.info("keyword_count=%s", keyword_count)
+        logger.info("site_total_cnt=%s", job.setting.site_total_cnt)
+        logger.info("cpcha_cnt=%s", job.setting.cpcha_cnt)
+        logger.info("dup_yn=%s", job.setting.dup_yn)
+
     logger.info("=" * 70)
 
 
@@ -299,11 +318,13 @@ class ExecutionResultStore:
             self,
             connection: Optional[Connection],
             hist_id: int,
+            user_service_id: int,
             logger,
             console_status: ConsoleStatus,
     ) -> None:
         self.connection = connection
         self.hist_id = hist_id
+        self.user_service_id = user_service_id
         self.logger = logger
         self.console_status = console_status
 
@@ -359,6 +380,32 @@ class ExecutionResultStore:
         elif status.upper() == "FAIL":
             self.updated_fail_count += 1
 
+    def load_existing_store_names(self) -> set[str]:
+        """같은 USER_SERVICE_ID의 과거 성공 결과에서 스토어명을 읽는다."""
+        while True:
+            self.connection = ensure_database_connection(
+                connection=self.connection,
+                logger=self.logger,
+                console_status=self.console_status,
+            )
+
+            try:
+                return select_existing_store_names(
+                    connection=self.connection,
+                    user_service_id=self.user_service_id,
+                )
+            except pymysql.MySQLError as error:
+                self.console_status.finish()
+                self.logger.error(
+                    "[DB] 과거 스토어명 조회 실패 "
+                    "| USER_SERVICE_ID=%s | ERROR=%s",
+                    self.user_service_id,
+                    error,
+                )
+                close_database_connection(self.connection)
+                self.connection = None
+                time.sleep(DB_RECONNECT_INTERVAL_SEC)
+
 
 def mark_status_with_reconnect(
         connection: Optional[Connection],
@@ -411,11 +458,11 @@ def mark_status_with_reconnect(
 
 
 def build_job_error_message(
-        result: MessageExecutionResult,
+        result: WorkerExecutionResult,
 ) -> str:
     """실행 이력 ERROR_MESSAGE에 저장할 전체 결과 요약을 만든다."""
     summary = (
-        f"메시지 발송 결과: "
+        f"작업 결과: "
         f"SUCCESS={result.success_count}, "
         f"FAIL={result.fail_count}, "
         f"SKIP={result.skipped_count}"
@@ -431,18 +478,17 @@ def build_job_error_message(
 
 def log_job_result(
         job: ExecutionJob,
-        result: MessageExecutionResult,
+        result: WorkerExecutionResult,
         final_status: str,
         logger,
 ) -> None:
-    """실제 메시지 발송 작업의 최종 결과를 출력한다."""
+    """서비스 Worker의 최종 결과를 출력한다."""
     logger.info(
-        "[JOB] %s | HIST_ID=%s | 조회=%s | 최종대상=%s | "
-        "선INSERT=%s | SUCCESS=%s | FAIL=%s | SKIP=%s",
+        "[JOB] %s | SERVICE_CODE=%s | HIST_ID=%s | "
+        "INSERT=%s | SUCCESS=%s | FAIL=%s | SKIP=%s",
         final_status,
+        job.service_code,
         job.hist_id,
-        result.fetched_count,
-        result.target_count,
         result.inserted_count,
         result.success_count,
         result.fail_count,
@@ -461,8 +507,13 @@ def main() -> None:
     connection: Optional[Connection] = None
 
     try:
+        service_code = get_required_env("DAEMON_SERVICE_CODE").upper()
+        # 시작 시 잘못된 서비스 코드를 즉시 확인한다.
+        selenium_required = requires_selenium(service_code)
+
         logger.info("=" * 70)
         logger.info("[DAEMON] crawl-deamon을 시작합니다.")
+        logger.info("[DAEMON] 담당 SERVICE_CODE=%s", service_code)
         logger.info("=" * 70)
 
         connection = connect_database_until_success(
@@ -503,7 +554,10 @@ def main() -> None:
             )
 
             try:
-                job = claim_next_ready_execution(connection)
+                job = claim_next_ready_execution(
+                    connection=connection,
+                    service_code=service_code,
+                )
 
             except ValueError as error:
                 console_status.finish()
@@ -565,42 +619,50 @@ def main() -> None:
             result_store = ExecutionResultStore(
                 connection=connection,
                 hist_id=job.hist_id,
+                user_service_id=job.user_service_id,
                 logger=logger,
                 console_status=console_status,
             )
 
-            # 변경: 브라우저와 SeleniumUtils를 작업마다 새로 생성한다.
-            selenium_utils = SeleniumUtils(
-                headless=False,
-                debug=True,
-                log_func=lambda message: logger.info(message),
-            )
+            selenium_utils = None
+            driver = None
 
             try:
-                logger.info(
-                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 실행합니다.",
-                    job.hist_id,
-                )
+                if selenium_required:
+                    from src.utils.selenium_utils import SeleniumUtils
 
-                driver = selenium_utils.start_driver(
-                    timeout=30,
-                    view_mode="browser",
-                    window_size=(1200, 900),
-                )
+                    selenium_utils = SeleniumUtils(
+                        headless=False,
+                        debug=True,
+                        log_func=lambda message: logger.info(message),
+                    )
 
-                logger.info(
-                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저 실행 성공",
-                    job.hist_id,
-                )
+                    logger.info(
+                        "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 실행합니다.",
+                        job.hist_id,
+                    )
+                    driver = selenium_utils.start_driver(
+                        timeout=30,
+                        view_mode="browser",
+                        window_size=(1200, 900),
+                    )
+                    logger.info(
+                        "[SELENIUM] HIST_ID=%s | Chrome 브라우저 실행 성공",
+                        job.hist_id,
+                    )
+                else:
+                    logger.info(
+                        "[BROWSER] HIST_ID=%s | Worker가 일반 Chrome을 직접 제어합니다.",
+                        job.hist_id,
+                    )
 
-                # execute_message_job 내부에서 자동 로그인 후 기존 작업을 진행한다.
-                result = execute_message_job(
-                    driver=driver,
-                    selenium_utils=selenium_utils,
+                result = execute_registered_worker(
+                    service_code=service_code,
                     job=job,
                     logger=logger,
-                    result_inserter=result_store.insert,
-                    result_updater=result_store.update,
+                    result_store=result_store,
+                    driver=driver,
+                    selenium_utils=selenium_utils,
                 )
 
                 connection = result_store.connection
@@ -685,12 +747,14 @@ def main() -> None:
                 )
 
             finally:
-                # 변경: 성공/실패와 관계없이 작업이 끝나면 브라우저를 종료한다.
-                selenium_utils.quit()
-                logger.info(
-                    "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 종료했습니다.",
-                    job.hist_id,
-                )
+                # 팬더 작업의 Selenium Chrome은 공통 main에서 종료한다.
+                # 네이버 작업의 일반 Chrome은 Worker.cleanup()에서 종료한다.
+                if selenium_utils is not None:
+                    selenium_utils.quit()
+                    logger.info(
+                        "[SELENIUM] HIST_ID=%s | Chrome 브라우저를 종료했습니다.",
+                        job.hist_id,
+                    )
 
 
                 next_log_cleanup_at = cleanup_logs_if_due(

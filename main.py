@@ -222,7 +222,17 @@ def print_claimed_job(
             "exclude_duplicate_yn=%s",
             job.setting.exclude_duplicate_yn,
         )
-        logger.info("login_id=%s", job.setting.login_id)
+        logger.info(
+            "login_account_count=%s",
+            len(job.setting.login_accounts),
+        )
+        logger.info(
+            "login_accounts=%s",
+            ", ".join(
+                account.login_id
+                for account in job.setting.login_accounts
+            ),
+        )
     elif job.service_code == "NAVER_SHOP_TOTAL_DETAIL":
         keyword_count = len([
             value

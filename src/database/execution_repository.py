@@ -37,6 +37,14 @@ ALLOWED_RESULT_STATUSES = {
 
 
 @dataclass(frozen=True)
+class PandaLoginAccount:
+    """팬더티비 로그인 계정."""
+
+    login_id: str
+    login_password: str
+
+
+@dataclass(frozen=True)
 class PandaExecutionSetting:
     """SETTING_JSON에서 읽은 팬더티비 작업 설정."""
 
@@ -45,8 +53,7 @@ class PandaExecutionSetting:
     end_page: int
     message_text: str
     exclude_duplicate_yn: bool
-    login_id: str
-    login_password: str
+    login_accounts: tuple[PandaLoginAccount, ...]
 
 
 @dataclass(frozen=True)
@@ -164,9 +171,6 @@ def parse_panda_execution_setting(
         data.get("message_text", "")
     ).strip()
 
-    login_id = str(data.get("login_id") or "").strip()
-    login_password = str(data.get("login_password") or "")
-
     try:
         start_page = int(data.get("start_page"))
         end_page = int(data.get("end_page"))
@@ -181,9 +185,7 @@ def parse_panda_execution_setting(
         )
 
     if start_page < 1:
-        raise ValueError(
-            "start_page는 1 이상이어야 합니다."
-        )
+        raise ValueError("start_page는 1 이상이어야 합니다.")
 
     if end_page < start_page:
         raise ValueError(
@@ -191,18 +193,58 @@ def parse_panda_execution_setting(
         )
 
     if not message_text:
-        raise ValueError(
-            "message_text 값이 없습니다."
+        raise ValueError("message_text 값이 없습니다.")
+
+    login_accounts_raw = data.get("login_accounts")
+
+    if not isinstance(login_accounts_raw, list):
+        raise ValueError("login_accounts는 배열이어야 합니다.")
+
+    if not login_accounts_raw:
+        raise ValueError("login_accounts가 비어 있습니다.")
+
+    login_accounts = []
+    seen_login_ids = set()
+
+    for index, account_data in enumerate(
+            login_accounts_raw,
+            start=1,
+    ):
+        if not isinstance(account_data, dict):
+            raise ValueError(
+                f"login_accounts[{index}] 형식이 올바르지 않습니다."
+            )
+
+        login_id = str(
+            account_data.get("login_id") or ""
+        ).strip()
+
+        login_password = str(
+            account_data.get("login_password") or ""
         )
 
-    if not login_id:
-        raise ValueError(
-            "login_id 값이 없습니다."
-        )
+        if not login_id:
+            raise ValueError(
+                f"login_accounts[{index}].login_id 값이 없습니다."
+            )
 
-    if not login_password:
-        raise ValueError(
-            "login_password 값이 없습니다."
+        if not login_password:
+            raise ValueError(
+                f"login_accounts[{index}].login_password 값이 없습니다."
+            )
+
+        if login_id in seen_login_ids:
+            raise ValueError(
+                f"login_accounts에 중복 login_id가 있습니다: {login_id}"
+            )
+
+        seen_login_ids.add(login_id)
+
+        login_accounts.append(
+            PandaLoginAccount(
+                login_id=login_id,
+                login_password=login_password,
+            )
         )
 
     return PandaExecutionSetting(
@@ -213,8 +255,7 @@ def parse_panda_execution_setting(
         exclude_duplicate_yn=normalize_boolean(
             data.get("exclude_duplicate_yn")
         ),
-        login_id=login_id,
-        login_password=login_password,
+        login_accounts=tuple(login_accounts),
     )
 
 

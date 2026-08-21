@@ -132,8 +132,12 @@ python -m PyInstaller `
 --collect-all whisper `
 --collect-all torch `
 --collect-all pyaudiowpatch `
+--hidden-import undetected_chromedriver `
 --hidden-import pyautogui `
 --hidden-import pyperclip `
+--hidden-import src.workers.panda_worker `
+--hidden-import src.database.execution_repository `
+--hidden-import src.utils.selenium_utils `
 main.py
 ```
 

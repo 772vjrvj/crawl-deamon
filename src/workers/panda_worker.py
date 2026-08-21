@@ -9,7 +9,9 @@
    - userIdx 없음: SKIP
 3. INSERT 단계가 전부 끝난 뒤 실제 메시지 발송 시작
 4. 대상별 응답에 따라 READY를 SUCCESS 또는 FAIL로 변경
-5. 발송 제한이 발생하면 남은 READY 대상을 SKIP으로 변경하고 중단
+5. 계정을 라운드로빈으로 순환하며 발송
+6. 한 계정이 제한되면 같은 대상을 다음 계정으로 재시도
+7. 모든 계정이 제한되면 현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
 """
 
 import json
@@ -27,7 +29,10 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from src.database.execution_repository import ExecutionJob
+from src.database.execution_repository import (
+    ExecutionJob,
+    PandaLoginAccount,
+)
 from src.utils.selenium_utils import SeleniumUtils
 
 
@@ -273,6 +278,108 @@ def fill_login_form(
 
     _click_element(driver, login_button)
     logger.info("[LOGIN] 아이디와 비밀번호를 입력하고 로그인 버튼을 클릭했습니다.")
+
+
+def reset_panda_login_session(
+        driver: WebDriver,
+        logger,
+) -> None:
+    """계정 변경/재로그인 전에 기존 팬더 세션을 초기화한다."""
+    logger.info("[LOGIN] 기존 팬더 로그인 세션을 초기화합니다.")
+
+    try:
+        driver.delete_all_cookies()
+    except Exception as error:
+        logger.warning("[LOGIN] 쿠키 초기화 실패: %s", error)
+
+    try:
+        driver.get(PANDA_LIVE_URL)
+        WebDriverWait(driver, 10).until(
+            lambda current_driver: current_driver.execute_script(
+                "return document.readyState"
+            ) == "complete"
+        )
+    except Exception:
+        pass
+
+    try:
+        driver.execute_script(
+            """
+            try { window.localStorage.clear(); } catch (e) {}
+            try { window.sessionStorage.clear(); } catch (e) {}
+            """
+        )
+    except Exception:
+        pass
+
+    try:
+        driver.delete_all_cookies()
+    except Exception:
+        pass
+
+
+def login_panda_with_retry(
+        driver: WebDriver,
+        selenium_utils: SeleniumUtils,
+        account: PandaLoginAccount,
+        logger,
+) -> None:
+    """로그인 전체 과정을 최대 2회(최초 1회 + 재시도 1회) 수행한다."""
+    max_attempts = 2
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(
+                "[LOGIN] 팬더 로그인 시작 | login_id=%s | attempt=%s/%s",
+                account.login_id,
+                attempt,
+                max_attempts,
+            )
+
+            reset_panda_login_session(
+                driver=driver,
+                logger=logger,
+            )
+
+            login_panda(
+                driver=driver,
+                selenium_utils=selenium_utils,
+                login_id=account.login_id,
+                login_password=account.login_password,
+                logger=logger,
+            )
+
+            logger.info(
+                "[LOGIN] 팬더 로그인 완료 | login_id=%s",
+                account.login_id,
+            )
+            return
+
+        except Exception as error:
+            logger.warning(
+                "[LOGIN] 팬더 로그인 실패 | login_id=%s | attempt=%s/%s | ERROR=%s",
+                account.login_id,
+                attempt,
+                max_attempts,
+                error,
+            )
+
+            if attempt >= max_attempts:
+                raise RuntimeError(
+                    "팬더 로그인에 최종 실패했습니다. "
+                    f"login_id={account.login_id}, error={error}"
+                ) from error
+
+            logger.info(
+                "[LOGIN] 로그인 전체 과정을 1회 다시 시도합니다. | login_id=%s",
+                account.login_id,
+            )
+            time.sleep(1)
+
+
+def is_message_limit_error(error: Exception) -> bool:
+    """쪽지 전송 제한 오류인지 확인한다."""
+    return MESSAGE_LIMIT_TEXT in str(error)
 
 
 def login_panda(
@@ -821,17 +928,20 @@ def skip_remaining_results(
 
 def send_messages_after_insert(
         driver: WebDriver,
+        selenium_utils: SeleniumUtils,
         prepared_results: List[PreparedResult],
         job: ExecutionJob,
         logger,
         result_updater: ResultUpdater,
+        initial_account_index: int = 0,
 ) -> tuple[int, int, int, bool, Optional[str]]:
     """
-    모든 상세 결과 INSERT가 끝난 뒤 실제 쪽지를 발송한다.
+    계정을 라운드로빈으로 순환하며 실제 쪽지를 발송한다.
 
-    - 성공: READY -> SUCCESS
-    - 개별 실패: READY -> FAIL 후 다음 대상 계속 진행
-    - 쪽지 발송 제한: 현재 대상 FAIL, 남은 대상 SKIP 후 즉시 중단
+    - 정상: A -> B -> C -> A ... 순환
+    - 제한: 같은 대상을 다음 계정으로 즉시 재시도
+    - 같은 대상에서 모든 계정 제한: 현재 대상 FAIL, 남은 대상 SKIP, 작업 중단
+    - 기타 개별 오류: 현재 대상 FAIL 후 다음 대상으로 진행
     """
     success_count = 0
     fail_count = 0
@@ -839,150 +949,240 @@ def send_messages_after_insert(
     stopped_early = False
     stop_reason: Optional[str] = None
 
-    total_count = len(
-        prepared_results
-    )
+    accounts = list(job.setting.login_accounts)
+    if not accounts:
+        raise RuntimeError("사용 가능한 팬더 로그인 계정이 없습니다.")
+
+    account_count = len(accounts)
+    active_account_index = initial_account_index
+    round_robin_index = initial_account_index
+    total_count = len(prepared_results)
 
     logger.info(
         "[MESSAGE] 선INSERT 완료 후 실제 쪽지 발송 시작 "
-        "| HIST_ID=%s | 대상=%s | URL=%s",
+        "| HIST_ID=%s | 대상=%s | 계정수=%s | URL=%s",
         job.hist_id,
         total_count,
+        account_count,
         SEND_MESSAGE_API_URL,
     )
 
-    for index, prepared in enumerate(
-            prepared_results,
-            start=1,
-    ):
-        target = prepared.result_data.get(
-            "target",
-            {},
-        )
+    for target_index, prepared in enumerate(prepared_results, start=1):
+        target = prepared.result_data.get("target", {})
         user_idx = target.get("userIdx")
-        user_nick = target.get(
-            "userNick",
-            "",
-        )
-
+        user_nick = target.get("userNick", "")
 
         payload = {
             "message": job.setting.message_text,
             "userIdx": user_idx,
         }
 
-        try:
-            # 발송 직전에도 로그인 상태를 확인한다.
-            ensure_panda_logged_in(driver)
+        candidate_account_index = round_robin_index % account_count
+        limited_account_count = 0
+        attempted_account_ids: List[str] = []
+        target_completed = False
 
-            response_json = post_form_with_browser(
-                driver=driver,
-                url=SEND_MESSAGE_API_URL,
-                form_data=payload,
-            )
+        while limited_account_count < account_count:
+            account = accounts[candidate_account_index]
+            attempted_account_ids.append(account.login_id)
 
-            updated_data = build_updated_result_data(
-                prepared=prepared,
-                status="SUCCESS",
-                result_message="메시지 발송에 성공했습니다.",
-                sent_message=job.setting.message_text,
-                send_attempted_yn=True,
-                send_success_yn=True,
-                send_response=response_json,
-            )
+            try:
+                if active_account_index != candidate_account_index:
+                    logger.info(
+                        "[ACCOUNT] 계정 변경 | HIST_ID=%s | target=%s/%s | login_id=%s",
+                        job.hist_id,
+                        target_index,
+                        total_count,
+                        account.login_id,
+                    )
+                    login_panda_with_retry(
+                        driver=driver,
+                        selenium_utils=selenium_utils,
+                        account=account,
+                        logger=logger,
+                    )
+                    active_account_index = candidate_account_index
 
-            result_updater(
-                prepared.result_id,
-                "SUCCESS",
-                updated_data,
-                None,
-            )
+                ensure_panda_logged_in(driver)
 
-            success_count += 1
-
-            logger.info(
-                "[MESSAGE] HIST_ID=%s | %s/%s | SUCCESS "
-                "| userNick=%s | userIdx=%s",
-                job.hist_id,
-                index,
-                total_count,
-                user_nick,
-                user_idx,
-            )
-
-        except Exception as error:
-            error_message = str(error)
-
-            updated_data = build_updated_result_data(
-                prepared=prepared,
-                status="FAIL",
-                result_message="메시지 발송에 실패했습니다.",
-                sent_message=job.setting.message_text,
-                send_attempted_yn=True,
-                send_success_yn=False,
-                send_response=None,
-            )
-
-            result_updater(
-                prepared.result_id,
-                "FAIL",
-                updated_data,
-                error_message,
-            )
-
-            fail_count += 1
-
-            logger.error(
-                "[MESSAGE] HIST_ID=%s | %s/%s | FAIL "
-                "| userNick=%s | userIdx=%s | ERROR=%s",
-                job.hist_id,
-                index,
-                total_count,
-                user_nick,
-                user_idx,
-                error_message,
-            )
-
-            # 계정 발송 제한은 이후 대상도 실패할 가능성이 높으므로 즉시 중단한다.
-            if MESSAGE_LIMIT_TEXT in error_message:
-                stopped_early = True
-                stop_reason = error_message
-
-                remaining_results = prepared_results[
-                                    index:
-                                    ]
-
-                additional_skip_count = skip_remaining_results(
-                    remaining_results=remaining_results,
-                    reason=(
-                        "계정의 쪽지 발송 제한으로 "
-                        "남은 대상을 발송하지 않았습니다."
-                    ),
-                    result_updater=result_updater,
-                    logger=logger,
-                    job=job,
+                logger.info(
+                    "[MESSAGE] 발송 시도 | HIST_ID=%s | %s/%s "
+                    "| login_id=%s | userNick=%s | userIdx=%s",
+                    job.hist_id,
+                    target_index,
+                    total_count,
+                    account.login_id,
+                    user_nick,
+                    user_idx,
                 )
 
-                logger.error(
-                    "[MESSAGE] 발송 제한으로 작업 중단 "
-                    "| HIST_ID=%s | SUCCESS=%s | FAIL=%s | SKIP=%s",
+                response_json = post_form_with_browser(
+                    driver=driver,
+                    url=SEND_MESSAGE_API_URL,
+                    form_data=payload,
+                )
+
+                updated_data = build_updated_result_data(
+                    prepared=prepared,
+                    status="SUCCESS",
+                    result_message="메시지 발송에 성공했습니다.",
+                    sent_message=job.setting.message_text,
+                    send_attempted_yn=True,
+                    send_success_yn=True,
+                    send_response=response_json,
+                )
+                updated_data["send_account_id"] = account.login_id
+                updated_data["send_attempt_accounts"] = list(attempted_account_ids)
+
+                result_updater(
+                    prepared.result_id,
+                    "SUCCESS",
+                    updated_data,
+                    None,
+                )
+
+                success_count += 1
+                target_completed = True
+                round_robin_index = (candidate_account_index + 1) % account_count
+
+                logger.info(
+                    "[MESSAGE] HIST_ID=%s | %s/%s | SUCCESS "
+                    "| login_id=%s | userNick=%s | userIdx=%s",
                     job.hist_id,
-                    success_count,
-                    fail_count,
-                    additional_skip_count,
+                    target_index,
+                    total_count,
+                    account.login_id,
+                    user_nick,
+                    user_idx,
                 )
                 break
 
-        # 마지막 대상이 아니고 중단되지 않았을 때만 랜덤 대기한다.
-        if (
-                index < total_count
-                and not stopped_early
-        ):
+            except Exception as error:
+                error_message = str(error)
+
+                if is_message_limit_error(error):
+                    limited_account_count += 1
+
+                    logger.warning(
+                        "[MESSAGE] 계정 쪽지 전송 제한 | HIST_ID=%s | target=%s/%s "
+                        "| login_id=%s | 제한계정=%s/%s | ERROR=%s",
+                        job.hist_id,
+                        target_index,
+                        total_count,
+                        account.login_id,
+                        limited_account_count,
+                        account_count,
+                        error_message,
+                    )
+
+                    if limited_account_count >= account_count:
+                        stop_reason = (
+                            "사용 가능한 모든 팬더 계정에서 쪽지 전송 제한이 발생했습니다. "
+                            f"accounts={','.join(attempted_account_ids)}"
+                        )
+
+                        updated_data = build_updated_result_data(
+                            prepared=prepared,
+                            status="FAIL",
+                            result_message=stop_reason,
+                            sent_message=job.setting.message_text,
+                            send_attempted_yn=True,
+                            send_success_yn=False,
+                            send_response=None,
+                        )
+                        updated_data["send_attempt_accounts"] = list(attempted_account_ids)
+
+                        result_updater(
+                            prepared.result_id,
+                            "FAIL",
+                            updated_data,
+                            stop_reason,
+                        )
+                        fail_count += 1
+                        stopped_early = True
+
+                        remaining_results = prepared_results[target_index:]
+                        additional_skip_count = skip_remaining_results(
+                            remaining_results=remaining_results,
+                            reason=(
+                                "모든 팬더 계정의 쪽지 전송 제한으로 "
+                                "남은 대상을 발송하지 않았습니다."
+                            ),
+                            result_updater=result_updater,
+                            logger=logger,
+                            job=job,
+                        )
+
+                        logger.error(
+                            "[MESSAGE] 모든 계정 전송 제한으로 작업 중단 "
+                            "| HIST_ID=%s | SUCCESS=%s | FAIL=%s | SKIP=%s",
+                            job.hist_id,
+                            success_count,
+                            fail_count,
+                            additional_skip_count,
+                        )
+                        break
+
+                    candidate_account_index = (candidate_account_index + 1) % account_count
+                    logger.info(
+                        "[ACCOUNT] 다음 계정으로 동일 대상 재시도 "
+                        "| HIST_ID=%s | next_login_id=%s | userNick=%s",
+                        job.hist_id,
+                        accounts[candidate_account_index].login_id,
+                        user_nick,
+                    )
+                    continue
+
+                updated_data = build_updated_result_data(
+                    prepared=prepared,
+                    status="FAIL",
+                    result_message="메시지 발송에 실패했습니다.",
+                    sent_message=job.setting.message_text,
+                    send_attempted_yn=True,
+                    send_success_yn=False,
+                    send_response=None,
+                )
+                updated_data["send_account_id"] = account.login_id
+                updated_data["send_attempt_accounts"] = list(attempted_account_ids)
+
+                result_updater(
+                    prepared.result_id,
+                    "FAIL",
+                    updated_data,
+                    error_message,
+                )
+
+                fail_count += 1
+                target_completed = True
+                round_robin_index = (candidate_account_index + 1) % account_count
+
+                logger.error(
+                    "[MESSAGE] HIST_ID=%s | %s/%s | FAIL "
+                    "| login_id=%s | userNick=%s | userIdx=%s | ERROR=%s",
+                    job.hist_id,
+                    target_index,
+                    total_count,
+                    account.login_id,
+                    user_nick,
+                    user_idx,
+                    error_message,
+                )
+                break
+
+        if stopped_early:
+            break
+
+        if not target_completed:
+            raise RuntimeError(
+                "메시지 처리 결과가 결정되지 않았습니다. "
+                f"userIdx={user_idx}"
+            )
+
+        if target_index < total_count:
             delay = random.uniform(
                 MESSAGE_SEND_DELAY_MIN_SEC,
                 MESSAGE_SEND_DELAY_MAX_SEC,
             )
-
             logger.info(
                 "[MESSAGE] 다음 발송까지 %.2f초 대기합니다.",
                 delay,
@@ -991,11 +1191,12 @@ def send_messages_after_insert(
 
     logger.info(
         "[MESSAGE] 실제 쪽지 발송 완료 "
-        "| HIST_ID=%s | SUCCESS=%s | FAIL=%s | 추가SKIP=%s",
+        "| HIST_ID=%s | SUCCESS=%s | FAIL=%s | 추가SKIP=%s | STOPPED=%s",
         job.hist_id,
         success_count,
         fail_count,
         additional_skip_count,
+        stopped_early,
     )
 
     return (
@@ -1015,13 +1216,23 @@ def execute_message_job(
         result_inserter: ResultInserter,
         result_updater: ResultUpdater,
 ) -> MessageExecutionResult:
-    """자동 로그인 → 랭킹 조회 → 선INSERT → 실제 발송 순서로 실행한다."""
-    # 변경: 작업마다 SETTING_JSON의 계정으로 새로 로그인한다.
-    login_panda(
+    """자동 로그인 -> 랭킹 조회 -> 선INSERT -> 계정 순환 발송 순서로 실행한다."""
+    accounts = list(job.setting.login_accounts)
+
+    if not accounts:
+        raise RuntimeError("팬더 로그인 계정이 없습니다.")
+
+    logger.info(
+        "[ACCOUNT] 팬더 메시지 작업 계정수=%s",
+        len(accounts),
+    )
+
+    first_account = accounts[0]
+
+    login_panda_with_retry(
         driver=driver,
         selenium_utils=selenium_utils,
-        login_id=job.setting.login_id,
-        login_password=job.setting.login_password,
+        account=first_account,
         logger=logger,
     )
 
@@ -1039,13 +1250,9 @@ def execute_message_job(
     )
 
     if job.setting.exclude_duplicate_yn:
-        target_items = remove_duplicates(
-            fetched_items
-        )
+        target_items = remove_duplicates(fetched_items)
     else:
-        target_items = list(
-            fetched_items
-        )
+        target_items = list(fetched_items)
 
     logger.info(
         "[RANKING] HIST_ID=%s | 전체조회=%s | 최종대상=%s",
@@ -1054,7 +1261,6 @@ def execute_message_job(
         len(target_items),
     )
 
-    # 1단계: 모든 결과를 READY 또는 SKIP으로 먼저 INSERT한다.
     prepared_results, initial_skip_count = insert_all_results_first(
         items=target_items,
         job=job,
@@ -1062,7 +1268,6 @@ def execute_message_job(
         result_inserter=result_inserter,
     )
 
-    # 2단계: 선INSERT가 모두 완료된 경우에만 실제 발송을 시작한다.
     (
         success_count,
         fail_count,
@@ -1071,10 +1276,12 @@ def execute_message_job(
         stop_reason,
     ) = send_messages_after_insert(
         driver=driver,
+        selenium_utils=selenium_utils,
         prepared_results=prepared_results,
         job=job,
         logger=logger,
         result_updater=result_updater,
+        initial_account_index=0,
     )
 
     return MessageExecutionResult(
@@ -1084,9 +1291,10 @@ def execute_message_job(
         success_count=success_count,
         fail_count=fail_count,
         skipped_count=(
-                initial_skip_count
-                + additional_skip_count
+            initial_skip_count
+            + additional_skip_count
         ),
         stopped_early=stopped_early,
         stop_reason=stop_reason,
     )
+

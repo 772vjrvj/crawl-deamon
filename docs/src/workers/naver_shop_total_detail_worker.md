@@ -64,25 +64,27 @@ Remove-Item -Recurse -Force .\build\crawl-deamon-naver-shop -ErrorAction Silentl
 Remove-Item -Recurse -Force .\dist\crawl-deamon-naver-shop -ErrorAction SilentlyContinue
 Remove-Item -Force .\crawl-deamon-naver-shop.spec -ErrorAction SilentlyContinue
 
+```powershell
 python -m PyInstaller `
   --noconfirm `
---clean `
+  --clean `
   --onedir `
---contents-directory _internal `
+  --contents-directory _internal `
   --console `
---name crawl-deamon-naver-shop `
+  --name crawl-deamon `
   --paths "E:\git\crawl-deamon" `
---collect-all whisper `
+  --collect-all whisper `
   --collect-all torch `
---collect-all pyaudiowpatch `
+  --collect-all pyaudiowpatch `
+  --collect-all selenium `
+  --collect-all undetected_chromedriver `
   --hidden-import pyautogui `
---hidden-import pyperclip `
+  --hidden-import pyperclip `
   --hidden-import src.core.services.ai_whisper `
---hidden-import src.workers.naver_shop_total_detail_worker `
-  --exclude-module src.workers.panda_worker `
---exclude-module selenium `
-  --exclude-module undetected_chromedriver `
-.\main.py
+  --hidden-import src.workers.panda_worker `
+  --hidden-import src.workers.naver_shop_total_detail_worker `
+  .\main.py
+```
 
 Whisper와 Torch가 포함되므로 팬더 빌드보다 빌드 시간과 결과 용량이 훨씬 크다.
 

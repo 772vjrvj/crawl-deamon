@@ -36,6 +36,62 @@ from src.database.execution_repository import (
 from src.utils.selenium_utils import SeleniumUtils
 
 
+# ============================================================
+# 팬더라이브 쪽지 발송 API 응답 / 데몬 처리 기준
+# ============================================================
+#
+# [HTTP 400] 발신 계정 쪽지 전송 제한
+#
+# 확인된 message:
+#   쪽지 전송이 제한되었습니다. 잠시 후 다시 시도해 주세요.
+#
+# 판별 문자열:
+#   "쪽지 전송이 제한되었습니다"
+#
+# 데몬 처리:
+#   - 현재 발신 계정은 더 이상 사용하지 않음
+#   - 같은 대상을 다음 로그인 계정으로 즉시 재시도
+#   - 다음 계정에서 성공하면 이후 대상도 해당 계정으로 계속 발송
+#   - 모든 로그인 계정에서 동일한 전송 제한이 발생하면
+#     60분 대기 후 같은 대상부터 전체 계정을 1회 재확인
+#   - 재확인에서도 모든 계정이 제한이면
+#     현재 대상 FAIL, 남은 대상 SKIP 후 작업 종료
+#
+#
+# [HTTP 400] 상대 BJ 쪽지 수신 제한
+#
+# 확인된 message 예시:
+#   BJ님께서 브론즈(30일) 등급 아래인 경우
+#   쪽지 수신을 제한하여 발송이 불가능합니다.
+#
+#   BJ님께서 감색 등급 아래인 경우
+#   쪽지 수신을 제한하여 발송이 불가능합니다.
+#
+# 판별 문자열:
+#   "쪽지 수신을 제한"
+#
+# 데몬 처리:
+#   - 상대 BJ의 수신 설정에 의한 제한으로 판단
+#   - 다른 발신 계정으로 재시도하지 않음
+#   - 현재 대상 FAIL
+#   - 현재 로그인 계정은 그대로 유지
+#   - 다음 대상으로 계속 진행
+#
+#
+# [HTTP 200] 정상 발송
+#
+# 데몬 처리:
+#   - SUCCESS
+#   - 현재 로그인 계정을 그대로 유지
+#
+# 데몬 결과 표시:
+#   - 메시지 발송에 성공했습니다.
+#
+# 참고:
+#   성공 응답 JSON의 실제 message/result 전체 구조는 현재 확인된 로그만으로
+#   특정 문자열 판별 기준을 만들지 않고 HTTP/API 정상 여부로 처리한다.
+# ============================================================
+
 RANKING_API_URL = "https://api.pandalive.co.kr/v1/live/cache"
 SEND_MESSAGE_API_URL = "https://api.pandalive.co.kr/v1/post/send_message"
 
@@ -43,6 +99,7 @@ PANDA_LIVE_URL = "https://www.pandalive.co.kr/"
 
 LOGIN_BUTTON_TEXT = "로그인 / 회원가입"
 MESSAGE_LIMIT_TEXT = "쪽지 전송이 제한되었습니다"
+MESSAGE_RECEIVE_LIMIT_TEXT = "쪽지 수신을 제한"
 
 # 자동 로그인 대기 시간
 AD_POPUP_WAIT_SEC = 3
@@ -52,8 +109,11 @@ LOGIN_RESULT_WAIT_SEC = 20
 PAGE_SIZE = 20
 
 # 실제 쪽지 발송 사이의 랜덤 대기 시간
-MESSAGE_SEND_DELAY_MIN_SEC = 5
-MESSAGE_SEND_DELAY_MAX_SEC = 7
+MESSAGE_SEND_DELAY_MIN_SEC = 20
+MESSAGE_SEND_DELAY_MAX_SEC = 30
+
+# 모든 발신 계정이 전송 제한일 때 대기 시간
+MESSAGE_LIMIT_COOLDOWN_SEC = 60 * 60
 
 RANKING_PAGE_URLS = {
     "rankingPersonalBJ": (
@@ -378,8 +438,35 @@ def login_panda_with_retry(
 
 
 def is_message_limit_error(error: Exception) -> bool:
-    """쪽지 전송 제한 오류인지 확인한다."""
+    """발신 계정의 쪽지 전송 제한 오류인지 확인한다."""
     return MESSAGE_LIMIT_TEXT in str(error)
+
+
+def is_message_receive_limit_error(error: Exception) -> bool:
+    """상대 BJ의 쪽지 수신 제한 오류인지 확인한다."""
+    return MESSAGE_RECEIVE_LIMIT_TEXT in str(error)
+
+
+def restart_panda_browser(
+        selenium_utils: SeleniumUtils,
+        logger,
+) -> WebDriver:
+    """발신 계정 변경 전에 기존 Chrome을 완전히 종료하고 새 Chrome을 실행한다."""
+    logger.info("[SELENIUM] 계정 변경을 위해 기존 Chrome 브라우저를 종료합니다.")
+
+    selenium_utils.quit()
+
+    logger.info("[SELENIUM] 새 Chrome 브라우저를 실행합니다.")
+
+    new_driver = selenium_utils.start_driver(
+        timeout=30,
+        view_mode="browser",
+        window_size=(1200, 900),
+    )
+
+    logger.info("[SELENIUM] 계정 변경용 Chrome 브라우저 재실행 완료")
+
+    return new_driver
 
 
 def login_panda(
@@ -536,11 +623,11 @@ def post_form_with_browser(
 
         if isinstance(response_data, dict):
             error_message = (
-                response_data.get("message")
+                    response_data.get("message")
                     or json.dumps(
-                    response_data,
-                    ensure_ascii=False,
-                )
+                response_data,
+                ensure_ascii=False,
+            )
             )
         else:
             error_message = (
@@ -679,9 +766,13 @@ def fetch_rankings(
         if not page_items:
             break
 
-        for item in page_items:
+        for page_item_index, item in enumerate(page_items, start=1):
             normalized_item = dict(item)
             normalized_item["_source_page"] = page_number
+            normalized_item["_source_rank"] = (
+                    (page_number - 1) * PAGE_SIZE
+                    + page_item_index
+            )
             all_items.append(normalized_item)
 
         if page_number < job.setting.end_page:
@@ -693,6 +784,88 @@ def fetch_rankings(
         )
 
     return all_items
+
+
+def get_rank_range(job: ExecutionJob) -> tuple[int, int]:
+    """
+    SETTING_JSON에서 시작순위/종료순위를 읽는다.
+
+    execution_repository.py를 수정하지 않도록 ExecutionJob.setting_json에서
+    직접 읽는다. 값이 없는 기존 예약 데이터는 선택 페이지 전체 범위를
+    기본 순위 범위로 사용한다.
+    """
+    default_start_rank = (
+            (job.setting.start_page - 1) * PAGE_SIZE
+            + 1
+    )
+    default_end_rank = (
+            job.setting.end_page * PAGE_SIZE
+    )
+
+    try:
+        raw_settings = json.loads(job.setting_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        raw_settings = {}
+
+    if not isinstance(raw_settings, dict):
+        raw_settings = {}
+
+    fields = raw_settings.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+
+            code = str(field.get("code") or "").strip()
+            if not code:
+                continue
+
+            raw_settings[code] = field.get("value")
+
+    try:
+        start_rank = int(
+            raw_settings.get(
+                "start_rank",
+                default_start_rank,
+            )
+        )
+        end_rank = int(
+            raw_settings.get(
+                "end_rank",
+                default_end_rank,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "start_rank와 end_rank는 숫자여야 합니다."
+        ) from error
+
+    if start_rank < 1:
+        raise ValueError(
+            "start_rank는 1 이상이어야 합니다."
+        )
+
+    if end_rank < start_rank:
+        raise ValueError(
+            "end_rank는 start_rank보다 크거나 같아야 합니다."
+        )
+
+    return start_rank, end_rank
+
+
+def filter_rank_range(
+        items: List[Dict[str, Any]],
+        start_rank: int,
+        end_rank: int,
+) -> List[Dict[str, Any]]:
+    """조회한 랭킹 중 절대 순위가 시작순위~종료순위인 대상만 남긴다."""
+    return [
+        item
+        for item in items
+        if start_rank
+           <= int(item.get("_source_rank") or 0)
+           <= end_rank
+    ]
 
 
 def remove_duplicates(
@@ -748,6 +921,7 @@ def build_result_data(
         "sequence": index,
         "ranking_type": job.setting.ranking_type,
         "source_page": item.get("_source_page"),
+        "source_rank": item.get("_source_rank"),
         "message_text": job.setting.message_text,
         "status": status,
         "result_message": result_message,
@@ -938,10 +1112,13 @@ def send_messages_after_insert(
     """
     계정을 라운드로빈으로 순환하며 실제 쪽지를 발송한다.
 
-    - 정상: A -> B -> C -> A ... 순환
-    - 제한: 같은 대상을 다음 계정으로 즉시 재시도
-    - 같은 대상에서 모든 계정 제한: 현재 대상 FAIL, 남은 대상 SKIP, 작업 중단
-    - 기타 개별 오류: 현재 대상 FAIL 후 다음 대상으로 진행
+    - 정상: 현재 로그인 계정으로 계속 발송
+    - 발신 전송 제한: Chrome을 완전히 재시작한 뒤 같은 대상을 다음 계정으로 즉시 재시도
+    - 다음 계정에서 성공하면 이후 대상도 해당 계정을 계속 사용
+    - 상대 수신 제한: 현재 대상 FAIL 후 현재 계정을 유지하고 다음 대상으로 진행
+    - 같은 대상에서 모든 계정 제한: 60분 대기 후 같은 대상부터 전체 계정 1회 재확인
+    - 재확인에서도 모든 계정 제한: 현재 대상 FAIL, 남은 대상 SKIP, 작업 중단
+    - 기타 개별 오류: 현재 대상 FAIL 후 현재 계정을 유지하고 다음 대상으로 진행
     """
     success_count = 0
     fail_count = 0
@@ -981,6 +1158,7 @@ def send_messages_after_insert(
         limited_account_count = 0
         attempted_account_ids: List[str] = []
         target_completed = False
+        cooldown_retry_used = False
 
         while limited_account_count < account_count:
             account = accounts[candidate_account_index]
@@ -995,6 +1173,12 @@ def send_messages_after_insert(
                         total_count,
                         account.login_id,
                     )
+
+                    driver = restart_panda_browser(
+                        selenium_utils=selenium_utils,
+                        logger=logger,
+                    )
+
                     login_panda_with_retry(
                         driver=driver,
                         selenium_utils=selenium_utils,
@@ -1032,7 +1216,6 @@ def send_messages_after_insert(
                     send_response=response_json,
                 )
                 updated_data["send_account_id"] = account.login_id
-                updated_data["send_attempt_accounts"] = list(attempted_account_ids)
 
                 result_updater(
                     prepared.result_id,
@@ -1043,7 +1226,7 @@ def send_messages_after_insert(
 
                 success_count += 1
                 target_completed = True
-                round_robin_index = (candidate_account_index + 1) % account_count
+                round_robin_index = candidate_account_index
 
                 logger.info(
                     "[MESSAGE] HIST_ID=%s | %s/%s | SUCCESS "
@@ -1059,6 +1242,48 @@ def send_messages_after_insert(
 
             except Exception as error:
                 error_message = str(error)
+
+                # 상대 BJ가 쪽지 수신을 제한한 경우에는
+                # 발신 계정을 변경해도 동일하므로 현재 대상만 FAIL 처리하고
+                # 다음 대상으로 계속 진행한다.
+                if is_message_receive_limit_error(error):
+                    updated_data = build_updated_result_data(
+                        prepared=prepared,
+                        status="FAIL",
+                        result_message=(
+                            "상대 BJ가 쪽지 수신을 제한하여 "
+                            "발송할 수 없습니다."
+                        ),
+                        sent_message=job.setting.message_text,
+                        send_attempted_yn=True,
+                        send_success_yn=False,
+                        send_response=None,
+                    )
+                    updated_data["send_account_id"] = account.login_id
+
+                    result_updater(
+                        prepared.result_id,
+                        "FAIL",
+                        updated_data,
+                        error_message,
+                    )
+
+                    fail_count += 1
+                    target_completed = True
+                    round_robin_index = candidate_account_index
+
+                    logger.warning(
+                        "[MESSAGE] 상대 BJ 쪽지 수신 제한 | HIST_ID=%s | %s/%s "
+                        "| login_id=%s | userNick=%s | userIdx=%s | ERROR=%s",
+                        job.hist_id,
+                        target_index,
+                        total_count,
+                        account.login_id,
+                        user_nick,
+                        user_idx,
+                        error_message,
+                    )
+                    break
 
                 if is_message_limit_error(error):
                     limited_account_count += 1
@@ -1076,8 +1301,37 @@ def send_messages_after_insert(
                     )
 
                     if limited_account_count >= account_count:
+                        if not cooldown_retry_used:
+                            cooldown_retry_used = True
+
+                            logger.warning(
+                                "[MESSAGE] 모든 계정 전송 제한 확인 | HIST_ID=%s "
+                                "| target=%s/%s | 60분 대기 후 같은 대상 재확인",
+                                job.hist_id,
+                                target_index,
+                                total_count,
+                            )
+
+                            time.sleep(MESSAGE_LIMIT_COOLDOWN_SEC)
+
+                            # 60분 후 실패했던 같은 대상부터 전체 계정을 다시 1회 확인한다.
+                            limited_account_count = 0
+                            attempted_account_ids = []
+                            candidate_account_index = round_robin_index % account_count
+
+                            logger.info(
+                                "[MESSAGE] 전송 제한 재확인 시작 | HIST_ID=%s "
+                                "| target=%s/%s | first_login_id=%s",
+                                job.hist_id,
+                                target_index,
+                                total_count,
+                                accounts[candidate_account_index].login_id,
+                            )
+                            continue
+
                         stop_reason = (
-                            "사용 가능한 모든 팬더 계정에서 쪽지 전송 제한이 발생했습니다. "
+                            "데몬: 60분 대기 후 재확인했지만 사용 가능한 모든 "
+                            "팬더 계정에서 쪽지 전송 제한이 계속 확인되었습니다. "
                             f"accounts={','.join(attempted_account_ids)}"
                         )
 
@@ -1090,7 +1344,7 @@ def send_messages_after_insert(
                             send_success_yn=False,
                             send_response=None,
                         )
-                        updated_data["send_attempt_accounts"] = list(attempted_account_ids)
+                        updated_data["send_account_id"] = account.login_id
 
                         result_updater(
                             prepared.result_id,
@@ -1098,6 +1352,7 @@ def send_messages_after_insert(
                             updated_data,
                             stop_reason,
                         )
+
                         fail_count += 1
                         stopped_early = True
 
@@ -1105,8 +1360,9 @@ def send_messages_after_insert(
                         additional_skip_count = skip_remaining_results(
                             remaining_results=remaining_results,
                             reason=(
-                                "모든 팬더 계정의 쪽지 전송 제한으로 "
-                                "남은 대상을 발송하지 않았습니다."
+                                "데몬 작업 중단: 60분 대기 후 재확인에서도 "
+                                "사용 가능한 발송 계정이 없어 남은 대상을 "
+                                "SKIP 처리했습니다."
                             ),
                             result_updater=result_updater,
                             logger=logger,
@@ -1114,8 +1370,9 @@ def send_messages_after_insert(
                         )
 
                         logger.error(
-                            "[MESSAGE] 모든 계정 전송 제한으로 작업 중단 "
-                            "| HIST_ID=%s | SUCCESS=%s | FAIL=%s | SKIP=%s",
+                            "[MESSAGE] 60분 대기 후에도 모든 계정 전송 제한 "
+                            "| 작업 중단 | HIST_ID=%s | SUCCESS=%s "
+                            "| FAIL=%s | SKIP=%s",
                             job.hist_id,
                             success_count,
                             fail_count,
@@ -1143,7 +1400,6 @@ def send_messages_after_insert(
                     send_response=None,
                 )
                 updated_data["send_account_id"] = account.login_id
-                updated_data["send_attempt_accounts"] = list(attempted_account_ids)
 
                 result_updater(
                     prepared.result_id,
@@ -1154,7 +1410,7 @@ def send_messages_after_insert(
 
                 fail_count += 1
                 target_completed = True
-                round_robin_index = (candidate_account_index + 1) % account_count
+                round_robin_index = candidate_account_index
 
                 logger.error(
                     "[MESSAGE] HIST_ID=%s | %s/%s | FAIL "
@@ -1249,15 +1505,33 @@ def execute_message_job(
         logger=logger,
     )
 
+    start_rank, end_rank = get_rank_range(job)
+
+    ranked_items = filter_rank_range(
+        items=fetched_items,
+        start_rank=start_rank,
+        end_rank=end_rank,
+    )
+
+    if not ranked_items:
+        raise RuntimeError(
+            "설정된 순위 범위에서 랭킹 데이터가 조회되지 않았습니다. "
+            f"start_rank={start_rank}, end_rank={end_rank}"
+        )
+
     if job.setting.exclude_duplicate_yn:
-        target_items = remove_duplicates(fetched_items)
+        target_items = remove_duplicates(ranked_items)
     else:
-        target_items = list(fetched_items)
+        target_items = list(ranked_items)
 
     logger.info(
-        "[RANKING] HIST_ID=%s | 전체조회=%s | 최종대상=%s",
+        "[RANKING] HIST_ID=%s | 전체조회=%s | 순위범위=%s~%s "
+        "| 순위필터후=%s | 최종대상=%s",
         job.hist_id,
         len(fetched_items),
+        start_rank,
+        end_rank,
+        len(ranked_items),
         len(target_items),
     )
 
@@ -1291,8 +1565,8 @@ def execute_message_job(
         success_count=success_count,
         fail_count=fail_count,
         skipped_count=(
-            initial_skip_count
-            + additional_skip_count
+                initial_skip_count
+                + additional_skip_count
         ),
         stopped_early=stopped_early,
         stop_reason=stop_reason,

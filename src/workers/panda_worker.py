@@ -1098,10 +1098,6 @@ def skip_remaining_results(
     return skipped_count
 
 
-
-
-
-
 def send_messages_after_insert(
         driver: WebDriver,
         selenium_utils: SeleniumUtils,

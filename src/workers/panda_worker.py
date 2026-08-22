@@ -231,12 +231,23 @@ def close_ad_popup_if_present(
 
 
 def click_login_entry(driver: WebDriver, logger) -> None:
-    """로그인/회원가입 영역과 이어서 나타나는 로그인 버튼을 누른다."""
+    """로그인/회원가입 영역을 클릭하고 로그인 모달까지 안정적으로 연다."""
+
     login_entry_xpath = (
         "//*[self::div or self::button]"
         "[normalize-space(.)='로그인 / 회원가입']"
     )
 
+    tooltip_login_xpath = (
+        "//button[@type='button' and not(@role='tab') "
+        "and normalize-space(.)='로그인']"
+    )
+
+    login_tab_xpath = (
+        "//button[@role='tab' and .//p[normalize-space(.)='로그인']]"
+    )
+
+    # 1. 로그인 / 회원가입 영역 클릭
     login_entry = WebDriverWait(
         driver,
         LOGIN_ELEMENT_WAIT_SEC,
@@ -247,38 +258,68 @@ def click_login_entry(driver: WebDriver, logger) -> None:
     )
 
     _click_element(driver, login_entry)
-    logger.info("[LOGIN] 로그인 / 회원가입 버튼을 클릭했습니다.")
 
-    tooltip_login_xpath = (
-        "//button[@type='button' and not(@role='tab') "
-        "and normalize-space(.)='로그인']"
-    )
-    login_tab_xpath = (
-        "//button[@role='tab' and .//p[normalize-space(.)='로그인']]"
+    logger.info(
+        "[LOGIN] 로그인 / 회원가입 버튼을 클릭했습니다."
     )
 
+    # 2. 클릭 후 툴팁 로그인 또는 로그인 모달이 나타날 때까지 기다린다.
     try:
-        tooltip_login = WebDriverWait(
+        WebDriverWait(
             driver,
-            5,
+            LOGIN_ELEMENT_WAIT_SEC,
         ).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, tooltip_login_xpath)
-            )
+            lambda current_driver:
+            bool(_visible_elements(
+                current_driver,
+                tooltip_login_xpath,
+            ))
+            or
+            bool(_visible_elements(
+                current_driver,
+                login_tab_xpath,
+            ))
         )
 
-        _click_element(driver, tooltip_login)
-        logger.info("[LOGIN] 툴팁 로그인 버튼을 클릭했습니다.")
+    except TimeoutException as error:
+        raise RuntimeError(
+            "로그인 / 회원가입 클릭 후 "
+            "로그인 버튼 또는 로그인 모달이 나타나지 않았습니다."
+        ) from error
 
-    except TimeoutException:
-        # 사이트 상태에 따라 툴팁 없이 로그인 모달이 바로 열릴 수 있다.
-        if not _visible_elements(driver, login_tab_xpath):
+    # 3. 로그인 모달이 이미 직접 열린 경우
+    login_tabs = _visible_elements(
+        driver,
+        login_tab_xpath,
+    )
+
+    if login_tabs:
+        logger.info(
+            "[LOGIN] 로그인 모달이 바로 열렸습니다."
+        )
+
+    else:
+        # 4. 툴팁 로그인 버튼이 나온 경우 클릭
+        tooltip_buttons = _visible_elements(
+            driver,
+            tooltip_login_xpath,
+        )
+
+        if not tooltip_buttons:
             raise RuntimeError(
-                "툴팁 로그인 버튼 또는 로그인 모달을 찾지 못했습니다."
+                "툴팁 로그인 버튼을 찾지 못했습니다."
             )
 
-        logger.info("[LOGIN] 로그인 모달이 바로 열렸습니다.")
+        _click_element(
+            driver,
+            tooltip_buttons[0],
+        )
 
+        logger.info(
+            "[LOGIN] 툴팁 로그인 버튼을 클릭했습니다."
+        )
+
+    # 5. 최종 로그인 탭이 실제로 클릭 가능한 상태가 될 때까지 기다린다.
     login_tab = WebDriverWait(
         driver,
         LOGIN_ELEMENT_WAIT_SEC,
@@ -288,8 +329,15 @@ def click_login_entry(driver: WebDriver, logger) -> None:
         )
     )
 
-    _click_element(driver, login_tab)
-    logger.info("[LOGIN] 로그인 탭을 클릭했습니다.")
+    _click_element(
+        driver,
+        login_tab,
+    )
+
+    logger.info(
+        "[LOGIN] 로그인 탭을 클릭했습니다."
+    )
+
 
 
 def fill_login_form(

@@ -105,18 +105,18 @@ python -m PyInstaller `
   --onedir `
   --contents-directory _internal `
   --console `
-  --name crawl-deamon `
+  --name crawl-deamon-panda `
   --paths "E:\git\crawl-deamon" `
-  --collect-all whisper `
-  --collect-all torch `
-  --collect-all pyaudiowpatch `
   --collect-all selenium `
   --collect-all undetected_chromedriver `
-  --hidden-import pyautogui `
-  --hidden-import pyperclip `
-  --hidden-import src.core.services.ai_whisper `
   --hidden-import src.workers.panda_worker `
-  --hidden-import src.workers.naver_shop_total_detail_worker `
+  --exclude-module whisper `
+  --exclude-module torch `
+  --exclude-module pyaudiowpatch `
+  --exclude-module pyautogui `
+  --exclude-module pyperclip `
+  --exclude-module src.core.services.ai_whisper `
+  --exclude-module src.workers.naver_shop_total_detail_worker `
   .\main.py
 ```
 

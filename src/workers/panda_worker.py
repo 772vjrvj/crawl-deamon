@@ -113,6 +113,9 @@ MESSAGE_SEND_DELAY_SEC = 5
 # 발신 계정 전송 제한 발생 시 쿨타임
 MESSAGE_LIMIT_COOLDOWN_SEC = 10 * 60
 
+# 쿨타임 후 동일 대상 최대 재시도 횟수
+MESSAGE_LIMIT_MAX_RETRY_COUNT = 2
+
 RANKING_PAGE_URLS = {
     "rankingPersonalBJ": (
         "https://www.pandalive.co.kr/ranking/rankingPersonalBJ"
@@ -1160,8 +1163,9 @@ def send_messages_after_insert(
 
     - 정상 발송 후 다음 대상까지 5초 대기
     - 상대 BJ 수신 제한은 현재 대상 FAIL 후 다음 대상으로 진행
-    - 발신 계정 전송 제한은 10분 대기 후 같은 대상 1회 재시도
-    - 재시도 후에도 발신 제한이면 현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
+    - 발신 계정 전송 제한은 10분 대기 후 같은 대상을 최대 2회 재시도
+    - 최대 재시도 후에도 발신 제한이면
+      현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
     """
     success_count = 0
     fail_count = 0
@@ -1171,7 +1175,9 @@ def send_messages_after_insert(
 
     accounts = list(job.setting.login_accounts)
     if not accounts:
-        raise RuntimeError("사용 가능한 팬더 로그인 계정이 없습니다.")
+        raise RuntimeError(
+            "사용 가능한 팬더 로그인 계정이 없습니다."
+        )
 
     # login_accounts 배열의 첫 번째 계정만 사용한다.
     account = accounts[0]
@@ -1186,8 +1192,15 @@ def send_messages_after_insert(
         SEND_MESSAGE_API_URL,
     )
 
-    for target_index, prepared in enumerate(prepared_results, start=1):
-        target = prepared.result_data.get("target", {})
+    for target_index, prepared in enumerate(
+            prepared_results,
+            start=1,
+    ):
+        target = prepared.result_data.get(
+            "target",
+            {},
+        )
+
         user_idx = target.get("userIdx")
         user_nick = target.get("userNick", "")
 
@@ -1218,58 +1231,150 @@ def send_messages_after_insert(
                 )
 
             except Exception as error:
-                # 상대 BJ 수신 제한은 쿨타임 대상이 아니다.
+
+                # ------------------------------------------------
+                # 상대 BJ 수신 제한
+                # ------------------------------------------------
+                # 상대방 설정 문제이므로 쿨타임 대상이 아니다.
                 if is_message_receive_limit_error(error):
                     raise
 
-                # 발신 계정 전송 제한은 10분 대기 후 같은 대상을 1회 재시도한다.
+                # ------------------------------------------------
+                # 발신 계정 전송 제한
+                # ------------------------------------------------
                 if is_message_limit_error(error):
-                    logger.warning(
-                        "[MESSAGE] 전송 제한 발생 | HIST_ID=%s | %s/%s "
-                        "| login_id=%s | %s초 쿨타임 후 동일 대상 재시도",
-                        job.hist_id,
-                        target_index,
-                        total_count,
-                        account.login_id,
-                        MESSAGE_LIMIT_COOLDOWN_SEC,
-                    )
 
-                    logger.info(
-                        "[MESSAGE] 쿨타임 시작 | HIST_ID=%s | %s초 대기",
-                        job.hist_id,
-                        MESSAGE_LIMIT_COOLDOWN_SEC,
-                    )
+                    last_limit_error = error
 
-                    time.sleep(MESSAGE_LIMIT_COOLDOWN_SEC)
+                    for retry_count in range(
+                            1,
+                            MESSAGE_LIMIT_MAX_RETRY_COUNT + 1,
+                    ):
+                        logger.warning(
+                            "[MESSAGE] 전송 제한 발생 "
+                            "| HIST_ID=%s | %s/%s "
+                            "| login_id=%s "
+                            "| 재시도=%s/%s "
+                            "| %s초 쿨타임 후 동일 대상 재시도",
+                            job.hist_id,
+                            target_index,
+                            total_count,
+                            account.login_id,
+                            retry_count,
+                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                            MESSAGE_LIMIT_COOLDOWN_SEC,
+                        )
 
-                    logger.info(
-                        "[MESSAGE] 쿨타임 종료 | 동일 대상 재시도 "
-                        "| HIST_ID=%s | %s/%s | login_id=%s",
-                        job.hist_id,
-                        target_index,
-                        total_count,
-                        account.login_id,
-                    )
+                        logger.info(
+                            "[MESSAGE] 쿨타임 시작 "
+                            "| HIST_ID=%s "
+                            "| 재시도=%s/%s "
+                            "| %s초 대기",
+                            job.hist_id,
+                            retry_count,
+                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                            MESSAGE_LIMIT_COOLDOWN_SEC,
+                        )
 
-                    response_json = post_form_with_browser(
-                        driver=driver,
-                        url=SEND_MESSAGE_API_URL,
-                        form_data=payload,
-                    )
+                        time.sleep(
+                            MESSAGE_LIMIT_COOLDOWN_SEC
+                        )
+
+                        logger.info(
+                            "[MESSAGE] 쿨타임 종료 "
+                            "| 동일 대상 재시도 "
+                            "| HIST_ID=%s | %s/%s "
+                            "| login_id=%s "
+                            "| 재시도=%s/%s",
+                            job.hist_id,
+                            target_index,
+                            total_count,
+                            account.login_id,
+                            retry_count,
+                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                        )
+
+                        try:
+                            response_json = (
+                                post_form_with_browser(
+                                    driver=driver,
+                                    url=SEND_MESSAGE_API_URL,
+                                    form_data=payload,
+                                )
+                            )
+
+                            logger.info(
+                                "[MESSAGE] 쿨타임 후 "
+                                "동일 대상 재시도 성공 "
+                                "| HIST_ID=%s | %s/%s "
+                                "| login_id=%s "
+                                "| 재시도=%s/%s",
+                                job.hist_id,
+                                target_index,
+                                total_count,
+                                account.login_id,
+                                retry_count,
+                                MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                            )
+
+                            # 성공했으므로 재시도 루프 종료
+                            break
+
+                        except Exception as retry_error:
+
+                            # 상대방 수신 제한 등
+                            # 발신 제한 이외의 오류로 바뀐 경우
+                            # 기존 외부 예외 처리로 넘긴다.
+                            if not is_message_limit_error(
+                                    retry_error
+                            ):
+                                raise
+
+                            last_limit_error = retry_error
+
+                            logger.warning(
+                                "[MESSAGE] 쿨타임 후에도 "
+                                "전송 제한 지속 "
+                                "| HIST_ID=%s | %s/%s "
+                                "| login_id=%s "
+                                "| 재시도=%s/%s",
+                                job.hist_id,
+                                target_index,
+                                total_count,
+                                account.login_id,
+                                retry_count,
+                                MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                            )
+
+                            # 최대 재시도까지 제한이면
+                            # 아래 기존 FAIL 처리로 넘긴다.
+                            if (
+                                    retry_count
+                                    >= MESSAGE_LIMIT_MAX_RETRY_COUNT
+                            ):
+                                raise last_limit_error
+
                 else:
                     raise
 
+            # ----------------------------------------------------
             # 정상 발송 성공 처리
+            # ----------------------------------------------------
             updated_data = build_updated_result_data(
                 prepared=prepared,
                 status="SUCCESS",
-                result_message="메시지 발송에 성공했습니다.",
+                result_message=(
+                    "메시지 발송에 성공했습니다."
+                ),
                 sent_message=job.setting.message_text,
                 send_attempted_yn=True,
                 send_success_yn=True,
                 send_response=response_json,
             )
-            updated_data["send_account_id"] = account.login_id
+
+            updated_data["send_account_id"] = (
+                account.login_id
+            )
 
             result_updater(
                 prepared.result_id,
@@ -1279,8 +1384,10 @@ def send_messages_after_insert(
             )
 
             logger.info(
-                "[MESSAGE] 발송 성공 | HIST_ID=%s | %s/%s "
-                "| login_id=%s | userNick=%s | userIdx=%s",
+                "[MESSAGE] 발송 성공 "
+                "| HIST_ID=%s | %s/%s "
+                "| login_id=%s "
+                "| userNick=%s | userIdx=%s",
                 job.hist_id,
                 target_index,
                 total_count,
@@ -1294,24 +1401,40 @@ def send_messages_after_insert(
         except Exception as error:
             error_message = str(error)
 
+            # ----------------------------------------------------
+            # 상대 BJ 수신 제한
+            # ----------------------------------------------------
             if is_message_receive_limit_error(error):
                 result_message = (
-                    "상대 BJ가 쪽지 수신을 제한하여 발송할 수 없습니다."
+                    "상대 BJ가 쪽지 수신을 제한하여 "
+                    "발송할 수 없습니다."
                 )
 
+            # ----------------------------------------------------
+            # 발신 계정 제한
+            # 최대 재시도까지 모두 실패
+            # ----------------------------------------------------
             elif is_message_limit_error(error):
                 stop_reason = (
-                    "10분 쿨타임 후 재시도했으나 쪽지 전송 제한이 계속되고 있습니다."
+                    f"{MESSAGE_LIMIT_COOLDOWN_SEC // 60}분 "
+                    f"쿨타임 후 동일 대상 재시도를 "
+                    f"{MESSAGE_LIMIT_MAX_RETRY_COUNT}회 수행했으나 "
+                    "쪽지 전송 제한이 계속되고 있습니다."
                 )
+
                 result_message = stop_reason
 
                 logger.warning(
-                    "[MESSAGE] 쿨타임 후에도 전송 제한 지속 "
-                    "| HIST_ID=%s | %s/%s | login_id=%s",
+                    "[MESSAGE] 최대 재시도 후에도 "
+                    "전송 제한 지속 "
+                    "| HIST_ID=%s | %s/%s "
+                    "| login_id=%s "
+                    "| 최대재시도=%s",
                     job.hist_id,
                     target_index,
                     total_count,
                     account.login_id,
+                    MESSAGE_LIMIT_MAX_RETRY_COUNT,
                 )
 
                 updated_data = build_updated_result_data(
@@ -1323,7 +1446,10 @@ def send_messages_after_insert(
                     send_success_yn=False,
                     send_response=None,
                 )
-                updated_data["send_account_id"] = account.login_id
+
+                updated_data["send_account_id"] = (
+                    account.login_id
+                )
 
                 result_updater(
                     prepared.result_id,
@@ -1333,8 +1459,11 @@ def send_messages_after_insert(
                 )
 
                 logger.warning(
-                    "[MESSAGE] 발송 실패 | HIST_ID=%s | %s/%s "
-                    "| login_id=%s | userNick=%s | userIdx=%s | ERROR=%s",
+                    "[MESSAGE] 발송 실패 "
+                    "| HIST_ID=%s | %s/%s "
+                    "| login_id=%s "
+                    "| userNick=%s | userIdx=%s "
+                    "| ERROR=%s",
                     job.hist_id,
                     target_index,
                     total_count,
@@ -1347,18 +1476,33 @@ def send_messages_after_insert(
                 fail_count += 1
                 stopped_early = True
 
-                remaining_results = prepared_results[target_index:]
-                additional_skip_count = skip_remaining_results(
-                    remaining_results=remaining_results,
-                    reason="발신 계정 전송 제한이 계속되어 남은 대상을 SKIP 처리했습니다.",
-                    result_updater=result_updater,
-                    logger=logger,
-                    job=job,
+                remaining_results = (
+                    prepared_results[target_index:]
                 )
+
+                additional_skip_count = (
+                    skip_remaining_results(
+                        remaining_results=remaining_results,
+                        reason=(
+                            "발신 계정 전송 제한이 "
+                            "최대 재시도 후에도 계속되어 "
+                            "남은 대상을 SKIP 처리했습니다."
+                        ),
+                        result_updater=result_updater,
+                        logger=logger,
+                        job=job,
+                    )
+                )
+
                 break
 
+            # ----------------------------------------------------
+            # 일반 발송 실패
+            # ----------------------------------------------------
             else:
-                result_message = "메시지 발송에 실패했습니다."
+                result_message = (
+                    "메시지 발송에 실패했습니다."
+                )
 
             updated_data = build_updated_result_data(
                 prepared=prepared,
@@ -1369,7 +1513,10 @@ def send_messages_after_insert(
                 send_success_yn=False,
                 send_response=None,
             )
-            updated_data["send_account_id"] = account.login_id
+
+            updated_data["send_account_id"] = (
+                account.login_id
+            )
 
             result_updater(
                 prepared.result_id,
@@ -1377,11 +1524,15 @@ def send_messages_after_insert(
                 updated_data,
                 error_message,
             )
+
             fail_count += 1
 
         if stopped_early:
             break
 
+        # --------------------------------------------------------
+        # 다음 대상 전 고정 대기
+        # --------------------------------------------------------
         if target_index < total_count:
             logger.info(
                 "[MESSAGE] %s초 후 다음 대상으로 진행합니다. "
@@ -1391,7 +1542,10 @@ def send_messages_after_insert(
                 target_index,
                 total_count,
             )
-            time.sleep(MESSAGE_SEND_DELAY_SEC)
+
+            time.sleep(
+                MESSAGE_SEND_DELAY_SEC
+            )
 
     return (
         success_count,

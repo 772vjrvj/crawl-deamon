@@ -11,8 +11,9 @@
 4. 대상별 응답에 따라 READY를 SUCCESS 또는 FAIL로 변경
 5. login_accounts의 첫 번째 계정만 사용하여 발송
 6. 발송 성공 후 다음 대상까지 5초 대기
-7. 발신 계정 전송 제한 발생 시 10분 대기 후 동일 대상을 1회 재시도
-8. 재시도 후에도 전송 제한이면 현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
+7. 발신 계정 전송 제한 발생 시 먼저 10분 대기 후 동일 대상을 재확인
+8. 10분 후에도 전송 제한이면 추가 50분 대기 후 동일 대상을 마지막으로 1회 재확인
+9. 추가 50분 후에도 계속 제한이면 현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
 """
 
 import json
@@ -51,9 +52,10 @@ from src.utils.selenium_utils import SeleniumUtils
 #
 # 데몬 처리:
 #   - login_accounts의 첫 번째 계정만 사용
-#   - 전송 제한 발생 시 10분 대기
-#   - 같은 계정/같은 대상을 1회 재시도
-#   - 재시도에서도 전송 제한이면
+#   - 전송 제한 발생 시 같은 브라우저/같은 로그인 세션 유지
+#   - 전송 제한 발생 시 먼저 10분 대기 후 같은 대상 재확인
+#   - 10분 후에도 제한이면 추가 50분 대기 후 같은 대상 마지막 재확인
+#   - 추가 50분 후에도 전송 제한이면
 #     현재 대상 FAIL, 남은 대상 SKIP 후 작업 종료
 #
 #
@@ -108,13 +110,13 @@ LOGIN_RESULT_WAIT_SEC = 20
 PAGE_SIZE = 20
 
 # 실제 쪽지 발송 사이의 고정 대기 시간
-MESSAGE_SEND_DELAY_SEC = 5
+MESSAGE_SEND_DELAY_SEC = 3
 
-# 발신 계정 전송 제한 발생 시 쿨타임
-MESSAGE_LIMIT_COOLDOWN_SEC = 10 * 60
+# 발신 계정 전송 제한 발생 시 1차 기본 쿨타임
+MESSAGE_LIMIT_FIRST_COOLDOWN_SEC = 10 * 60
 
-# 쿨타임 후 동일 대상 최대 재시도 횟수
-MESSAGE_LIMIT_MAX_RETRY_COUNT = 2
+# 10분 후에도 전송 제한이 계속될 때 추가로 기다릴 시간
+MESSAGE_LIMIT_SECOND_COOLDOWN_SEC = 50 * 60
 
 RANKING_PAGE_URLS = {
     "rankingPersonalBJ": (
@@ -1161,11 +1163,13 @@ def send_messages_after_insert(
     """
     login_accounts의 첫 번째 계정만 사용하여 실제 쪽지를 발송한다.
 
-    - 정상 발송 후 다음 대상까지 5초 대기
+    - 정상 발송 후 다음 대상까지 기존 고정 대기
     - 상대 BJ 수신 제한은 현재 대상 FAIL 후 다음 대상으로 진행
-    - 발신 계정 전송 제한은 10분 대기 후 같은 대상을 최대 2회 재시도
-    - 최대 재시도 후에도 발신 제한이면
+    - 발신 계정 전송 제한 발생 시 먼저 10분 대기 후 같은 대상을 재확인
+    - 10분 후에도 제한이면 추가 50분 대기 후 같은 대상을 마지막으로 재확인
+    - 추가 50분 후에도 발신 제한이면
       현재 대상 FAIL, 남은 READY 대상 SKIP 후 중단
+    - 대기 중에는 현재 Chrome 브라우저와 로그인 세션을 그대로 유지
     """
     success_count = 0
     fail_count = 0
@@ -1244,115 +1248,154 @@ def send_messages_after_insert(
                 # ------------------------------------------------
                 if is_message_limit_error(error):
 
-                    last_limit_error = error
+                    # ============================================
+                    # 1차: 기존 방식대로 10분 대기 후 재시도
+                    # ============================================
+                    first_cooldown_min = (
+                            MESSAGE_LIMIT_FIRST_COOLDOWN_SEC // 60
+                    )
 
-                    for retry_count in range(
-                            1,
-                            MESSAGE_LIMIT_MAX_RETRY_COUNT + 1,
-                    ):
-                        logger.warning(
-                            "[MESSAGE] 전송 제한 발생 "
+                    logger.warning(
+                        "[MESSAGE] 전송 제한 발생 "
+                        "| HIST_ID=%s | %s/%s "
+                        "| login_id=%s "
+                        "| %s분 쿨타임 후 동일 대상 재시도",
+                        job.hist_id,
+                        target_index,
+                        total_count,
+                        account.login_id,
+                        first_cooldown_min,
+                    )
+
+                    logger.info(
+                        "[MESSAGE] 1차 쿨타임 시작 "
+                        "| HIST_ID=%s "
+                        "| %s분 대기 "
+                        "| Chrome/로그인 세션 유지",
+                        job.hist_id,
+                        first_cooldown_min,
+                    )
+
+                    time.sleep(
+                        MESSAGE_LIMIT_FIRST_COOLDOWN_SEC
+                    )
+
+                    logger.info(
+                        "[MESSAGE] 1차 쿨타임 종료 "
+                        "| 동일 대상 재시도 "
+                        "| HIST_ID=%s | %s/%s "
+                        "| login_id=%s "
+                        "| 이번대기=%s분",
+                        job.hist_id,
+                        target_index,
+                        total_count,
+                        account.login_id,
+                        first_cooldown_min,
+                    )
+
+                    try:
+                        response_json = post_form_with_browser(
+                            driver=driver,
+                            url=SEND_MESSAGE_API_URL,
+                            form_data=payload,
+                        )
+
+                        logger.info(
+                            "[MESSAGE] 10분 쿨타임 후 "
+                            "동일 대상 재시도 성공 "
                             "| HIST_ID=%s | %s/%s "
-                            "| login_id=%s "
-                            "| 재시도=%s/%s "
-                            "| %s초 쿨타임 후 동일 대상 재시도",
+                            "| login_id=%s",
                             job.hist_id,
                             target_index,
                             total_count,
                             account.login_id,
-                            retry_count,
-                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
-                            MESSAGE_LIMIT_COOLDOWN_SEC,
+                        )
+
+                    except Exception as first_retry_error:
+
+                        # 10분 후 오류가 발신 계정 제한이 아니라면
+                        # 기존 외부 예외 처리로 넘긴다.
+                        if not is_message_limit_error(
+                                first_retry_error
+                        ):
+                            raise
+
+                        # ========================================
+                        # 2차: 10분 후에도 제한이면 추가 50분
+                        # ========================================
+                        second_cooldown_min = (
+                                MESSAGE_LIMIT_SECOND_COOLDOWN_SEC // 60
+                        )
+
+                        logger.warning(
+                            "[MESSAGE] 10분 쿨타임 후에도 "
+                            "전송 제한 지속 "
+                            "| HIST_ID=%s | %s/%s "
+                            "| login_id=%s "
+                            "| 추가 %s분 대기 후 마지막 재시도",
+                            job.hist_id,
+                            target_index,
+                            total_count,
+                            account.login_id,
+                            second_cooldown_min,
                         )
 
                         logger.info(
-                            "[MESSAGE] 쿨타임 시작 "
+                            "[MESSAGE] 추가 쿨타임 시작 "
                             "| HIST_ID=%s "
-                            "| 재시도=%s/%s "
-                            "| %s초 대기",
+                            "| %s분 대기 "
+                            "| Chrome/로그인 세션 유지",
                             job.hist_id,
-                            retry_count,
-                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
-                            MESSAGE_LIMIT_COOLDOWN_SEC,
+                            second_cooldown_min,
                         )
 
                         time.sleep(
-                            MESSAGE_LIMIT_COOLDOWN_SEC
+                            MESSAGE_LIMIT_SECOND_COOLDOWN_SEC
                         )
 
                         logger.info(
-                            "[MESSAGE] 쿨타임 종료 "
-                            "| 동일 대상 재시도 "
+                            "[MESSAGE] 추가 쿨타임 종료 "
+                            "| 동일 대상 마지막 재시도 "
                             "| HIST_ID=%s | %s/%s "
                             "| login_id=%s "
-                            "| 재시도=%s/%s",
+                            "| 이번대기=%s분",
                             job.hist_id,
                             target_index,
                             total_count,
                             account.login_id,
-                            retry_count,
-                            MESSAGE_LIMIT_MAX_RETRY_COUNT,
+                            second_cooldown_min,
                         )
 
                         try:
-                            response_json = (
-                                post_form_with_browser(
-                                    driver=driver,
-                                    url=SEND_MESSAGE_API_URL,
-                                    form_data=payload,
-                                )
+                            response_json = post_form_with_browser(
+                                driver=driver,
+                                url=SEND_MESSAGE_API_URL,
+                                form_data=payload,
                             )
 
                             logger.info(
-                                "[MESSAGE] 쿨타임 후 "
+                                "[MESSAGE] 추가 50분 쿨타임 후 "
                                 "동일 대상 재시도 성공 "
                                 "| HIST_ID=%s | %s/%s "
-                                "| login_id=%s "
-                                "| 재시도=%s/%s",
+                                "| login_id=%s",
                                 job.hist_id,
                                 target_index,
                                 total_count,
                                 account.login_id,
-                                retry_count,
-                                MESSAGE_LIMIT_MAX_RETRY_COUNT,
                             )
 
-                            # 성공했으므로 재시도 루프 종료
-                            break
+                        except Exception as second_retry_error:
 
-                        except Exception as retry_error:
+                            # 추가 50분 후에도 발신 제한이면
+                            # 아래 기존 FAIL/SKIP/중단 처리로 넘긴다.
+                            if is_message_limit_error(
+                                    second_retry_error
+                            ):
+                                raise second_retry_error
 
-                            # 상대방 수신 제한 등
-                            # 발신 제한 이외의 오류로 바뀐 경우
+                            # 상대 수신 제한 또는 일반 오류로 바뀌면
                             # 기존 외부 예외 처리로 넘긴다.
-                            if not is_message_limit_error(
-                                    retry_error
-                            ):
-                                raise
-
-                            last_limit_error = retry_error
-
-                            logger.warning(
-                                "[MESSAGE] 쿨타임 후에도 "
-                                "전송 제한 지속 "
-                                "| HIST_ID=%s | %s/%s "
-                                "| login_id=%s "
-                                "| 재시도=%s/%s",
-                                job.hist_id,
-                                target_index,
-                                total_count,
-                                account.login_id,
-                                retry_count,
-                                MESSAGE_LIMIT_MAX_RETRY_COUNT,
-                            )
-
-                            # 최대 재시도까지 제한이면
-                            # 아래 기존 FAIL 처리로 넘긴다.
-                            if (
-                                    retry_count
-                                    >= MESSAGE_LIMIT_MAX_RETRY_COUNT
-                            ):
-                                raise last_limit_error
+                            raise
 
                 else:
                     raise
@@ -1412,29 +1455,33 @@ def send_messages_after_insert(
 
             # ----------------------------------------------------
             # 발신 계정 제한
-            # 최대 재시도까지 모두 실패
+            # 10분 + 추가 50분 후에도 계속 제한
             # ----------------------------------------------------
             elif is_message_limit_error(error):
+                total_cooldown_min = (
+                                             MESSAGE_LIMIT_FIRST_COOLDOWN_SEC
+                                             + MESSAGE_LIMIT_SECOND_COOLDOWN_SEC
+                                     ) // 60
+
                 stop_reason = (
-                    f"{MESSAGE_LIMIT_COOLDOWN_SEC // 60}분 "
-                    f"쿨타임 후 동일 대상 재시도를 "
-                    f"{MESSAGE_LIMIT_MAX_RETRY_COUNT}회 수행했으나 "
-                    "쪽지 전송 제한이 계속되고 있습니다."
+                    f"10분 쿨타임 후에도 제한이 계속되어 "
+                    f"추가 50분을 대기했으나 "
+                    f"쪽지 전송 제한이 계속되고 있습니다. "
+                    f"총 대기시간={total_cooldown_min}분"
                 )
 
                 result_message = stop_reason
 
                 logger.warning(
-                    "[MESSAGE] 최대 재시도 후에도 "
+                    "[MESSAGE] 총 60분 후에도 "
                     "전송 제한 지속 "
                     "| HIST_ID=%s | %s/%s "
                     "| login_id=%s "
-                    "| 최대재시도=%s",
+                    "| 작업을 중단합니다.",
                     job.hist_id,
                     target_index,
                     total_count,
                     account.login_id,
-                    MESSAGE_LIMIT_MAX_RETRY_COUNT,
                 )
 
                 updated_data = build_updated_result_data(
@@ -1485,7 +1532,7 @@ def send_messages_after_insert(
                         remaining_results=remaining_results,
                         reason=(
                             "발신 계정 전송 제한이 "
-                            "최대 재시도 후에도 계속되어 "
+                            "10분 + 추가 50분 대기 후에도 계속되어 "
                             "남은 대상을 SKIP 처리했습니다."
                         ),
                         result_updater=result_updater,
@@ -1554,7 +1601,6 @@ def send_messages_after_insert(
         stopped_early,
         stop_reason,
     )
-
 
 def execute_message_job(
         driver: WebDriver,

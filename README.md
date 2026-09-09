@@ -174,3 +174,8 @@ C:\daemon\naver-shop\
 
 이렇게 실행하면 한 서비스의 장시간 작업이나 장애가 다른 서비스 큐를 막지 않습니다.
 팬더 Chrome은 headless로 실행되고 네이버만 일반 Chrome 창을 표시합니다.
+
+```text
+vjrvj772 /	Ksh@8818510
+nodebluemac22 /	Ksh@8818510
+```

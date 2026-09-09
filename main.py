@@ -76,6 +76,18 @@ def get_env_bool(name: str, default: bool) -> bool:
     )
 
 
+def get_rank_user_service_id() -> int:
+    """순위 큐의 고객 서비스 ID를 읽는다."""
+    raw_value = os.getenv("NAVER_SHOP_RANK_USER_SERVICE_ID", "8")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        raise RuntimeError("NAVER_SHOP_RANK_USER_SERVICE_ID는 숫자여야 합니다.") from None
+    if value <= 0:
+        raise RuntimeError("NAVER_SHOP_RANK_USER_SERVICE_ID는 양수여야 합니다.")
+    return value
+
+
 def check_database_connection(connection: Connection) -> None:
     """DB 연결을 처음 생성했을 때 정상 여부를 확인한다."""
     connection.ping()
@@ -534,6 +546,8 @@ def main() -> None:
     console_status = ConsoleStatus()
 
     connection: Optional[Connection] = None
+    rank_worker = None
+    rank_turn_due = False
 
     try:
         service_code = get_required_env("DAEMON_SERVICE_CODE").upper()
@@ -543,10 +557,32 @@ def main() -> None:
             "SELENIUM_HEADLESS",
             default=True,
         )
+        rank_enabled = get_env_bool("NAVER_SHOP_RANK_ENABLED", default=False)
+        rank_user_service_id = get_rank_user_service_id()
+
+        if rank_enabled:
+            from src.workers.naver_shop_total_detail_worker import (
+                NaverShopTotalDetailWorker,
+                register_rank_runner,
+            )
+
+            rank_worker = NaverShopTotalDetailWorker(
+                setting={"cpcha_cnt": 5},
+                logger=logger,
+                result_inserter=lambda *_args, **_kwargs: 0,
+                existing_store_loader=lambda: set(),
+            )
+            rank_worker.configure_rank(create_connection, rank_user_service_id)
+            register_rank_runner(rank_worker.process_rank_once)
 
         logger.info("=" * 70)
         logger.info("[DAEMON] crawl-deamon을 시작합니다.")
         logger.info("[DAEMON] 담당 SERVICE_CODE=%s", service_code)
+        logger.info(
+            "[RANK] 사용=%s | USER_SERVICE_ID=%s",
+            rank_enabled,
+            rank_user_service_id,
+        )
         if selenium_required:
             logger.info(
                 "[SELENIUM] HEADLESS=%s",
@@ -596,6 +632,11 @@ def main() -> None:
                 console_status=console_status,
             )
 
+            if rank_worker is not None and rank_turn_due:
+                rank_turn_due = False
+                if rank_worker.process_rank_once(context="일반 작업 종료"):
+                    continue
+
             try:
                 job = claim_next_ready_execution(
                     connection=connection,
@@ -624,6 +665,9 @@ def main() -> None:
                 continue
 
             if job is None:
+                if rank_worker is not None and rank_worker.process_rank_once():
+                    continue
+
                 now_text = datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
@@ -652,6 +696,9 @@ def main() -> None:
 
                 time.sleep(JOB_POLL_INTERVAL_SEC)
                 continue
+
+            if rank_worker is not None and rank_worker._browser_open:
+                rank_worker._close_browser()
 
             print_claimed_job(
                 job=job,
@@ -792,6 +839,7 @@ def main() -> None:
                 )
 
             finally:
+                rank_turn_due = service_code != "NAVER_SHOP_TOTAL_DETAIL"
                 # 팬더 작업의 Selenium Chrome은 공통 main에서 종료한다.
                 # 네이버 작업의 일반 Chrome은 Worker.cleanup()에서 종료한다.
                 if selenium_utils is not None:
@@ -822,6 +870,17 @@ def main() -> None:
 
     finally:
         console_status.finish()
+
+        if rank_worker is not None:
+            try:
+                rank_worker._close_browser()
+            except Exception:
+                pass
+            try:
+                from src.workers.naver_shop_total_detail_worker import clear_rank_runner
+                clear_rank_runner()
+            except Exception:
+                pass
 
         close_database_connection(connection)
         logger.info("[DB] MariaDB 연결을 종료했습니다.")

@@ -11,17 +11,39 @@ import time
 import wave
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote
 
 import pyaudiowpatch as pyaudio
 import pyautogui
 import pyperclip
 
 from src.core.services import ai_whisper
+from src.database.execution_repository import claim_next_rank_item, save_rank_result
 from src.workers.daemon_base_worker import (
     DaemonBaseWorker,
     ExistingStoreLoader,
     ResultInserter,
 )
+
+
+# 순위 처리는 이 Worker의 안전 지점에서만 호출한다.
+_rank_runner = None
+
+
+def register_rank_runner(runner) -> None:
+    global _rank_runner
+    _rank_runner = runner
+
+
+def clear_rank_runner() -> None:
+    global _rank_runner
+    _rank_runner = None
+
+
+def run_one_rank(worker, context: str) -> bool:
+    if _rank_runner is None or not worker.running:
+        return False
+    return bool(_rank_runner(worker, context))
 
 
 class NaverShopTotalDetailWorker(DaemonBaseWorker):
@@ -69,6 +91,10 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         self._stop_event = threading.Event()
         self._browser_open: bool = False
 
+        # main.py가 순위 기능을 켠 경우에만 설정한다.
+        self.rank_connection_factory = None
+        self.rank_user_service_id = 8
+
         self.total_cnt: int = 0
         self.current_cnt: int = 0
         self.before_pro_value: float = 0.0
@@ -86,6 +112,121 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         self.model: Any = None
         self.inserted_count: int = 0
         self.failed_count: int = 0
+
+    def configure_rank(self, connection_factory, user_service_id: int = 8) -> None:
+        self.rank_connection_factory = connection_factory
+        self.rank_user_service_id = int(user_service_id)
+
+    def _claim_rank_item(self):
+        """USER_SERVICE_ID=8인 순위 요청에서 처리할 상세 1건을 가져온다."""
+        if self.rank_connection_factory is None:
+            return None
+        connection = self.rank_connection_factory()
+        try:
+            return claim_next_rank_item(connection, self.rank_user_service_id)
+        finally:
+            connection.close()
+
+    def _save_rank_result(self, claim, status, rank_no, result_code, result_data, error_message=None):
+        connection = self.rank_connection_factory()
+        try:
+            save_rank_result(
+                connection,
+                claim,
+                self.rank_user_service_id,
+                status,
+                rank_no,
+                result_code,
+                result_data,
+                error_message,
+            )
+        finally:
+            connection.close()
+
+    def _read_rank_page(self, browser, keyword: str, page: int):
+        url = (
+            "https://msearch.shopping.naver.com/search/all?"
+            f"query={quote(keyword)}&origQuery={quote(keyword)}&"
+            f"pagingIndex={page}&pagingSize=40&productSet=total&"
+            "sort=rel&viewType=list"
+        )
+        pyautogui.hotkey("ctrl", "l")
+        pyperclip.copy(url)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+        if not browser._sleep_or_stop(4.0, "순위 페이지 이동 대기"):
+            raise RuntimeError("순위 조회가 중단되었습니다.")
+
+        captcha = browser.handle_captcha_with_retry()
+        if captcha in (browser.CAPTCHA_FAIL, browser.ACCESS_LIMITED):
+            raise RuntimeError("순위 페이지 캡차 또는 접속 제한")
+
+        pyautogui.hotkey("ctrl", "u")
+        if not browser._sleep_or_stop(2.0, "순위 소스 대기"):
+            raise RuntimeError("순위 조회가 중단되었습니다.")
+        pyautogui.hotkey("ctrl", "a")
+        pyautogui.hotkey("ctrl", "c")
+        if not browser._sleep_or_stop(1.0, "순위 소스 복사 대기"):
+            raise RuntimeError("순위 조회가 중단되었습니다.")
+        source = pyperclip.paste()
+        pyautogui.hotkey("ctrl", "w")
+        if browser.is_access_limited(source):
+            raise RuntimeError("순위 페이지 접속 제한")
+        return browser.extract_items_from_html(source)
+
+    def process_rank_once(self, browser_worker=None, context="대기") -> bool:
+        """DB에서 순위 1건만 가져와 조회하고 결과를 저장한다."""
+        claim = self._claim_rank_item()
+        if claim is None:
+            return False
+
+        browser = browser_worker or self
+        try:
+            if browser is self and not self.init_flag and not self.init():
+                raise RuntimeError("순위 Worker 초기화에 실패했습니다.")
+            if not browser._browser_open and not browser._open_chrome():
+                raise RuntimeError("순위 조회용 Chrome을 열지 못했습니다.")
+
+            found = None
+            checked = 0
+            for page in range(1, 11):
+                for value in self._read_rank_page(browser, str(claim["KEYWORD"]), page):
+                    item = value.get("item", value) if isinstance(value, dict) else {}
+                    checked += 1
+                    if str(item.get("id") or "") == str(claim["MID"]):
+                        found = int(item.get("rank"))
+                        break
+                if found is not None:
+                    break
+
+            result = {
+                "keyword": str(claim["KEYWORD"]),
+                "mid": str(claim["MID"]),
+                "rankNo": found,
+                "rankText": f"{found}위" if found is not None else "400위 초과",
+                "resultCode": "FOUND" if found is not None else "OVER_400",
+                "checkedCount": checked,
+                "checkedPages": page,
+            }
+            self._save_rank_result(
+                claim, "SUCCESS", found,
+                result["resultCode"], result,
+            )
+            self.log_signal_func(
+                f"✅ 순위 완료 | 키워드={claim['KEYWORD']} | "
+                f"MID={claim['MID']} | {result['rankText']}"
+            )
+        except Exception as error:
+            result = {
+                "keyword": str(claim["KEYWORD"]),
+                "mid": str(claim["MID"]),
+                "rankNo": None,
+                "rankText": "조회 실패",
+                "resultCode": "ERROR",
+            }
+            self._save_rank_result(claim, "FAIL", None, "ERROR", result, str(error))
+            self.log_signal_func(f"❌ 순위 실패 | ITEM_ID={claim['ITEM_ID']} | {error}")
+        return True
 
     # =========================================================
     # 초기화
@@ -823,6 +964,8 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                     # 접속 제한 대기 중에는 이 위치까지 오지 않으므로 진행률이 증가하지 않는다.
                     self.current_cnt += 1
 
+                    run_one_rank(self, f"목록 완료 | 키워드={kw} | page={page}")
+
                 if chunk_items_queue:
                     self.log_signal_func(
                         f"🚀 확보된 {len(chunk_items_queue)}개 상품 "
@@ -852,6 +995,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                                 f"⚠️ 상세 URL 없음 스킵 "
                                 f"| 키워드={kw} | page={p_num} | idx={idx + 1}"
                             )
+                            run_one_rank(self, f"상세 URL 없음 | 키워드={kw} | idx={idx + 1}")
                             continue
 
                         row_start_at = self._now_db()
@@ -977,6 +1121,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                                 f"| 키워드={kw} | page={p_num} "
                                 f"| 스토어={item.get('mallName')}"
                             )
+                            run_one_rank(self, f"방문자 0 스킵 | 키워드={kw} | idx={idx + 1}")
                             continue
 
                         categories = [
@@ -1050,6 +1195,8 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                                 f"| 키워드={kw} | page={p_num} | idx={idx + 1}",
                         ):
                             return True
+
+                        run_one_rank(self, f"상세 완료 | 키워드={kw} | idx={idx + 1}")
 
                 else:
                     self.log_signal_func(

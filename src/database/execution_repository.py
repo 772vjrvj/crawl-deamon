@@ -94,6 +94,125 @@ def current_datetime_text() -> str:
     )[:-3]
 
 
+def claim_next_rank_item(connection: Connection, user_service_id: int = 8):
+    """순위 부모와 상세 1건을 RUNNING으로 선점한다."""
+    now = current_datetime_text()
+    connection.begin()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT H.HIST_ID, I.ITEM_ID, I.ITEM_SEQ, I.KEYWORD, I.MID
+                FROM SERVICE_EXECUTION_HIST H
+                INNER JOIN SERVICE_EXECUTION_RANK_ITEM I
+                    ON I.HIST_ID = H.HIST_ID
+                WHERE H.USER_SERVICE_ID = %s
+                  AND H.STATUS IN ('READY', 'RUNNING')
+                  AND H.SCHEDULED_AT <= %s
+                  AND H.SETTING_JSON REGEXP
+                      '"executionType"[[:space:]]*:[[:space:]]*"NAVER_SHOP_RANK"'
+                  AND I.STATUS IN ('READY', 'RUNNING')
+                ORDER BY H.SCHEDULED_AT, H.HIST_ID, I.ITEM_SEQ
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (user_service_id, now),
+            )
+            row = cursor.fetchone()
+            if not row:
+                connection.rollback()
+                return None
+
+            cursor.execute(
+                """
+                UPDATE SERVICE_EXECUTION_HIST
+                SET STATUS = 'RUNNING', START_AT = COALESCE(START_AT, %s),
+                    END_AT = NULL, ERROR_MESSAGE = NULL
+                WHERE HIST_ID = %s AND USER_SERVICE_ID = %s
+                  AND STATUS IN ('READY', 'RUNNING')
+                """,
+                (now, row["HIST_ID"], user_service_id),
+            )
+            cursor.execute(
+                """
+                UPDATE SERVICE_EXECUTION_RANK_ITEM
+                SET STATUS = 'RUNNING', START_AT = %s, END_AT = NULL,
+                    UPDATED_AT = %s, ERROR_MESSAGE = NULL
+                WHERE ITEM_ID = %s AND HIST_ID = %s
+                  AND STATUS IN ('READY', 'RUNNING')
+                """,
+                (now, now, row["ITEM_ID"], row["HIST_ID"]),
+            )
+        connection.commit()
+        return dict(row)
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def save_rank_result(
+        connection: Connection,
+        claim: Dict[str, Any],
+        user_service_id: int,
+        status: str,
+        rank_no: Optional[int],
+        result_code: str,
+        result_data: Dict[str, Any],
+        error_message: Optional[str] = None,
+) -> None:
+    """순위 상세 결과를 저장하고 마지막 상세면 부모도 마감한다."""
+    now = current_datetime_text()
+    connection.begin()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE SERVICE_EXECUTION_RANK_ITEM
+                SET STATUS = %s, RANK_NO = %s, RESULT_CODE = %s,
+                    RESULT_JSON = %s, ERROR_MESSAGE = %s,
+                    END_AT = %s, UPDATED_AT = %s
+                WHERE ITEM_ID = %s AND HIST_ID = %s AND STATUS = 'RUNNING'
+                """,
+                (
+                    status, rank_no, result_code,
+                    json.dumps(result_data, ensure_ascii=False),
+                    (error_message or "")[:5000] or None,
+                    now, now, claim["ITEM_ID"], claim["HIST_ID"],
+                ),
+            )
+            cursor.execute(
+                """
+                SELECT STATUS, COUNT(*) AS CNT
+                FROM SERVICE_EXECUTION_RANK_ITEM
+                WHERE HIST_ID = %s
+                GROUP BY STATUS
+                """,
+                (claim["HIST_ID"],),
+            )
+            counts = {row["STATUS"]: int(row["CNT"]) for row in cursor.fetchall()}
+            if not counts.get("READY") and not counts.get("RUNNING"):
+                success = counts.get("SUCCESS", 0) + counts.get("SKIP", 0)
+                total = sum(counts.values())
+                parent_status = (
+                    "SUCCESS" if total and success == total
+                    else "PARTIAL_FAIL" if success
+                    else "FAIL"
+                )
+                cursor.execute(
+                    """
+                    UPDATE SERVICE_EXECUTION_HIST
+                    SET STATUS = %s, END_AT = %s
+                    WHERE HIST_ID = %s AND USER_SERVICE_ID = %s
+                      AND STATUS IN ('READY', 'RUNNING')
+                    """,
+                    (parent_status, now, claim["HIST_ID"], user_service_id),
+                )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def normalize_boolean(value: Any) -> bool:
     """JSON 값을 bool로 변환한다."""
     if isinstance(value, bool):
@@ -613,6 +732,9 @@ def claim_next_ready_execution(
         WHERE H.STATUS = 'READY'
           AND H.SCHEDULED_AT <= %s
           AND S.SERVICE_CODE = %s
+          -- 순위 요청은 네이버 순위 처리 함수가 1건씩 담당한다.
+          AND H.SETTING_JSON NOT REGEXP
+              '"executionType"[[:space:]]*:[[:space:]]*"NAVER_SHOP_RANK"'
         ORDER BY
             H.SCHEDULED_AT ASC,
             H.HIST_ID ASC

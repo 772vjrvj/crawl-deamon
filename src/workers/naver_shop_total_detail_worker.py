@@ -1087,10 +1087,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                     )
 
                     for idx, item_data in enumerate(chunk_items_queue):
-
-                        if idx > 2:
-                            break
-
                         if not self.running:
                             return self._log_and_return_true(
                                 f"🛑 사용자 중단 감지(상세 수집 중) "

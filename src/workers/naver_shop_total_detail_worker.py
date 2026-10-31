@@ -868,8 +868,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
 
             all_pages = list(range(start_p, end_p + 1))
 
-            # chunk_size = 10
-            chunk_size = 3
+            chunk_size = 10
 
             for i in range(0, len(all_pages), chunk_size):
 

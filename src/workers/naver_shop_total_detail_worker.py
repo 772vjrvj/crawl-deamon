@@ -2,28 +2,34 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import random
 import re
 import sys
 import threading
 import time
-import wave
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
-import pyaudiowpatch as pyaudio
 import pyautogui
 import pyperclip
 
-from src.core.services import ai_whisper
+from src.database.db_connection import get_required_env
 from src.database.execution_repository import claim_next_rank_item, save_rank_result
 from src.workers.daemon_base_worker import (
     DaemonBaseWorker,
     ExistingStoreLoader,
     ResultInserter,
 )
+
+import os
+import time
+import winreg
+
+from dotenv import load_dotenv
+import pygetwindow as gw
+
+
 
 
 # 순위 처리는 이 Worker의 안전 지점에서만 호출한다.
@@ -53,6 +59,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
     CAPTCHA_NONE = 1
     CAPTCHA_SOLVED = 2
     ACCESS_LIMITED = 3
+    SUCCESS = 5
 
     ACCESS_LIMIT_TEXTS: Tuple[str, ...] = (
         "쇼핑 서비스 접속이 일시적으로 제한되었습니다",
@@ -60,10 +67,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         "비정상적인 접근이 감지",
     )
 
-    # 캡차 음성 처리 단계가 장시간 멈추지 않도록 제한 시간을 둔다.
-    # 녹음은 실제 녹음 시간 17초에 장치 준비 시간을 더해 25초로 제한한다.
-    AUDIO_RECORD_TIMEOUT_SEC = 25.0
-    WHISPER_TRANSCRIBE_TIMEOUT_SEC = 60.0
 
     def __init__(
             self,
@@ -109,7 +112,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         self.excel_driver: Optional[Any] = None
         self.db_repository: Optional[Any] = None
         self.columns: List[str] = []
-        self.model: Any = None
         self.inserted_count: int = 0
         self.failed_count: int = 0
 
@@ -246,20 +248,11 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
             if sys.stdout is None:
                 sys.stdout = open(os.devnull, "w")
 
-            # 음성 캡처 프로그램 경로 확보
-            self._set_ffmpeg_path()
-
             # 모든 자동 조작 명령 사이에 기본적으로 0.4초씩 대기하도록 설정합니다.
             pyautogui.PAUSE = 0.4
 
             # 마우스를 화면 왼쪽 위 모서리로 이동하면 pyautogui 자동화가 즉시 중단되도록 설정
             pyautogui.FAILSAFE = True
-
-            # 네이버 작업이 실행될 때만 Whisper 모델을 로딩한다.
-            if self.model is None:
-                ai_whisper.init("small")
-                self.model = ai_whisper.get_model()
-                self.log_signal_func("✅ Whisper AI (service) 연결 완료")
 
             self.init_flag = True
             self.log_signal_func("✅ init 완료")
@@ -269,21 +262,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
             self.log_signal_func(f"❌ 초기화 에러: {e}")
             return False
 
-    def _set_ffmpeg_path(self) -> None:
-        resource_root = self.get_resource_root()
-        ffmpeg_path = os.path.join(
-            resource_root,
-            "resources",
-            "customers",
-            self.worker_name,
-            "bin",
-        )
-
-        if os.path.exists(ffmpeg_path):
-            os.environ["PATH"] = ffmpeg_path + os.pathsep + os.environ["PATH"]
-            self.log_signal_func("✅ 환경 변수 설정 완료")
-        else:
-            self.log_signal_func(f"⚠️ FFmpeg 경로 없음: {ffmpeg_path}")
 
     @staticmethod
     def _to_bool(value: Any) -> bool:
@@ -412,13 +390,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
 
         self._close_browser()
 
-        try:
-            if os.path.exists("captcha_audio_final.wav"):
-                os.remove("captcha_audio_final.wav")
-                self.log_signal_func("✅ [캡차 음성파일] 삭제")
-        except Exception:
-            pass
-
         # Repository 연결 종료 전에 hist 마감 및 엑셀 저장
         self.finalize_db_and_excel()
 
@@ -438,7 +409,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         finally:
             self.excel_driver = None
 
-        self.model = None
         self._cleaned_up = True
 
     # =========================================================
@@ -456,7 +426,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
             return False
 
         # 한영키에서 한글로 되어 있으면 chrome이 한글로 나오는 이슈가 있어서 클립보드에 붙여서 넣음
-        pyperclip.copy("chrome")
+        pyperclip.copy("chrome --new-window --start-maximized about:blank")
         pyautogui.hotkey("ctrl", "v")
         pyautogui.press("enter")
         if not self._sleep_or_stop(
@@ -573,90 +543,216 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
             return False
         return True
 
-    def _run_with_timeout(
-            self,
-            func: Any,
-            timeout_sec: float,
-            task_name: str,
-            *args: Any,
-            **kwargs: Any,
-    ) -> Tuple[bool, Any]:
-        """
-        블로킹 가능성이 있는 작업을 데몬 스레드에서 실행한다.
 
-        제한 시간 안에 작업이 끝나면 (True, 결과)를 반환하고,
-        제한 시간을 초과하거나 예외가 발생하면 (False, None)을 반환한다.
+    def open_new_tab(self, url: str) -> None:
+        """새 탭을 열고 지정한 URL로 이동한다."""
+        pyautogui.hotkey("ctrl", "t")
+        time.sleep(0.5)
+        self.move_to_url(url)
 
-        브라우저를 어떤 URL로 다시 열지는 호출한 목록/상세 처리부가 알고 있으므로,
-        여기서는 브라우저를 직접 조작하지 않고 실패 상태만 반환한다.
-        """
-        result_queue: queue.Queue[Tuple[str, Any]] = queue.Queue(maxsize=1)
 
-        def runner() -> None:
-            try:
-                result_queue.put(
-                    ("SUCCESS", func(*args, **kwargs)),
-                    block=False,
-                )
-            except Exception as e:
-                try:
-                    result_queue.put(
-                        ("ERROR", e),
-                        block=False,
-                    )
-                except queue.Full:
-                    pass
+    def move_to_url(self, url: str) -> None:
+        """현재 탭에서 지정한 URL로 이동한다."""
+        pyautogui.hotkey("ctrl", "l")
+        time.sleep(0.2)
 
-        thread = threading.Thread(
-            target=runner,
-            name=f"{self.worker_name}-{task_name}",
-            daemon=True,
+        pyperclip.copy(url)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+
+    def move_to_tab(self, num: int) -> None:
+        """지정한 번호의 크롬 탭으로 이동한다."""
+        if not 1 <= num <= 8:
+            raise ValueError("탭 번호는 1부터 8까지 입력해야 합니다.")
+
+        pyautogui.hotkey("ctrl", str(num))
+
+
+    def move_mouse_to_window_center(self):
+        """현재 활성화된 창의 정중앙으로 마우스를 이동한다."""
+        window = gw.getActiveWindow()
+
+        if window is None:
+            raise RuntimeError("활성화된 창을 찾지 못했습니다.")
+
+        center_x = window.left + window.width // 2
+        center_y = window.top + window.height // 2
+
+        pyautogui.moveTo(center_x, center_y, duration=0.5)
+
+        print(f"마우스 이동 완료: x={center_x}, y={center_y}")
+    
+    
+    def get_desktop_path(self) -> str:
+        """Windows에 설정된 실제 바탕화면 경로를 가져온다."""
+        registry_path = (
+            r"Software\Microsoft\Windows\CurrentVersion"
+            r"\Explorer\Shell Folders"
         )
+    
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_path) as key:
+            desktop_path, _ = winreg.QueryValueEx(key, "Desktop")
+    
+        return desktop_path
 
-        started_at = time.monotonic()
-        self.log_signal_func(
-            f"⏱️ {task_name} 시작 | 제한시간={timeout_sec:.1f}초"
+
+    def save_image_to_desktop(self):
+        """마우스 위치의 이미지를 우클릭 메뉴를 통해 바탕화면에 저장한다."""
+        save_path = os.path.join(self.get_desktop_path(), "test_test_test.png")
+    
+        # 이미지 위에서 우클릭
+        pyautogui.rightClick()
+        time.sleep(0.7)
+    
+        # 우클릭 메뉴의 두 번째 항목 선택
+        pyautogui.press("down", presses=2, interval=0.2)
+        pyautogui.press("enter")
+    
+        # 다른 이름으로 저장 창 대기
+        time.sleep(2)
+    
+        # 파일 이름에 바탕화면 전체 경로 입력
+        pyperclip.copy(save_path)
+        pyautogui.hotkey("ctrl", "a")
+        pyautogui.hotkey("ctrl", "v")
+        time.sleep(0.3)
+        pyautogui.press("enter")
+    
+        # 저장 처리 대기
+        time.sleep(3)
+    
+        # 덮어쓰기 확인 창에서 왼쪽으로 이동 후 엔터
+        pyautogui.press("left")
+        pyautogui.press("enter")
+    
+        # 덮어쓰기 확인 창 대기 후 '예' 선택
+        # pyautogui.press("y")
+
+    
+    def copy_content(self) -> str:
+    
+        # 현재 마우스 위치에서 왼쪽 클릭
+        pyautogui.click()
+    
+        # 네이버 페이지 전체 선택
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.3)
+    
+        # 이전 클립보드 내용 비우기
+        pyperclip.copy("")
+    
+        # 선택한 텍스트 복사
+        pyautogui.hotkey("ctrl", "c")
+    
+        time.sleep(0.3)
+    
+        # 클립보드에 텍스트가 복사될 때까지 최대 3초 대기
+        copied_text = ""
+        deadline = time.monotonic() + 3
+    
+        while time.monotonic() < deadline:
+            copied_text = pyperclip.paste()
+    
+            if copied_text:
+                break
+    
+            time.sleep(0.1)
+    
+        if not copied_text:
+            raise RuntimeError("네이버 페이지의 텍스트를 복사하지 못했습니다.")
+    
+        lines = copied_text.splitlines()
+    
+        # '아닙니다.'가 포함된 줄 찾기
+        start_index = next(
+            (i for i, line in enumerate(lines) if "아닙니다." in line),
+            None,
         )
-        thread.start()
-
-        while self.running:
-            elapsed = time.monotonic() - started_at
-            remaining = timeout_sec - elapsed
-
-            if remaining <= 0:
-                self.log_signal_func(
-                    f"⏰ {task_name} 제한시간 초과 "
-                    f"| 경과={elapsed:.1f}초 "
-                    f"| 제한={timeout_sec:.1f}초"
-                )
-                return False, None
-
-            try:
-                status, value = result_queue.get(
-                    timeout=min(0.2, remaining)
-                )
-            except queue.Empty:
-                continue
-
-            elapsed = time.monotonic() - started_at
-
-            if status == "ERROR":
-                self.log_signal_func(
-                    f"❌ {task_name} 예외 "
-                    f"| 경과={elapsed:.1f}초 "
-                    f"| 오류={value}"
-                )
-                return False, None
-
-            self.log_signal_func(
-                f"✅ {task_name} 완료 | 경과={elapsed:.1f}초"
-            )
-            return True, value
-
-        self.log_signal_func(
-            f"🛑 {task_name} 중단: running=False"
+    
+        if start_index is None:
+            raise ValueError("'아닙니다.'가 포함된 문장을 찾지 못했습니다.")
+    
+        # 그다음 '입력해주세요.'가 포함된 줄 찾기
+        end_index = next(
+            (
+                i
+                for i in range(start_index + 1, len(lines))
+                if "입력해주세요." in lines[i]
+            ),
+            None,
         )
-        return False, None
+    
+        if end_index is None:
+            raise ValueError("'입력해주세요.'가 포함된 문장을 찾지 못했습니다.")
+    
+        # 두 안내 문장 사이의 내용만 추출
+        content = "\n".join(lines[start_index + 1:end_index]).strip()
+    
+        if not content:
+            raise ValueError("두 안내 문장 사이에 내용이 없습니다.")
+    
+        # 추출한 내용만 클립보드에 저장
+        pyperclip.copy(content)
+    
+        return content
+
+    
+    def upload_image_and_paste_content(self, content: str) -> None:
+        # 바탕화면의 test.png 경로
+        image_path = os.path.join(self.get_desktop_path(), "test_test_test.png")
+    
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"이미지 파일을 찾을 수 없습니다: {image_path}")
+    
+        # 업로드 버튼으로 이동 후 파일 선택 창 열기
+        pyautogui.press("tab")
+        time.sleep(1)
+        pyautogui.press("enter")
+        time.sleep(1)
+        pyautogui.press("enter")
+    
+        # 파일 선택 창이 열릴 때까지 대기
+        time.sleep(2)
+    
+        # 이미지 경로 입력 후 선택
+        pyperclip.copy(image_path)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+    
+        # 이미지 업로드 및 입력창 포커스 이동 대기
+        time.sleep(3)
+    
+        # 내용 붙여넣기
+        pyperclip.copy(content)
+        pyautogui.hotkey("ctrl", "v")
+        pyautogui.press("enter")
+    
+        time.sleep(18)
+    
+    
+        # Shift + Tab 두 번
+        pyautogui.hotkey("shift", "tab")
+        time.sleep(1)
+        pyautogui.hotkey("shift", "tab")
+        time.sleep(1)
+    
+        # Tab 한 번
+        pyautogui.press("tab")
+        time.sleep(1)
+    
+        # Enter
+        pyautogui.press("enter")
+        time.sleep(2)
+    
+        pyautogui.hotkey("tab")
+        pyautogui.hotkey("tab")
+        pyautogui.hotkey("tab")
+        pyautogui.hotkey("tab")
+        pyautogui.hotkey("tab")
+        pyautogui.hotkey("tab")
+
+
+
 
     # =========================================================
     # main
@@ -756,6 +852,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         completed_keywords = 0
 
         for kw_idx, kw in enumerate(keywords, start=1):
+
             if not self.running:
                 return self._log_and_return_true(
                     f"🛑 사용자 중단 감지(main-키워드 시작 전) "
@@ -770,9 +867,12 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
             )
 
             all_pages = list(range(start_p, end_p + 1))
-            chunk_size = 10
+
+            # chunk_size = 10
+            chunk_size = 3
 
             for i in range(0, len(all_pages), chunk_size):
+
                 if not self.running:
                     return self._log_and_return_true(
                         f"🛑 사용자 중단 감지(chunk 시작 전) "
@@ -791,6 +891,17 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                     return self._log_and_return_true(
                         f"🛑 Chrome 실행 실패 또는 사용자 중단 | 키워드={kw}"
                     )
+
+                target_url_gpt = get_required_env("CHAT_GPT_ANSWER")
+
+                # gpt 열기
+                self.open_new_tab(target_url_gpt)
+                time.sleep(2)
+
+                # 5. 첫 번째 탭으로 이동
+                self.move_to_tab(1)
+                time.sleep(1)
+
 
                 self.log_signal_func(
                     f"📂 [{kw}] {current_chunk[0]}p ~ "
@@ -845,6 +956,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                             ):
                                 return True
 
+                            # 네이버 샵 열기
                             pyperclip.copy(target_url)
                             pyautogui.hotkey("ctrl", "v")
                             pyautogui.press("enter")
@@ -951,9 +1063,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                             ):
                                 return True
 
-
-
-
                     if not page_success:
                         self.log_signal_func(
                             f"❌ 페이지 최종 실패 "
@@ -978,6 +1087,10 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
                     )
 
                     for idx, item_data in enumerate(chunk_items_queue):
+
+                        if idx > 2:
+                            break
+
                         if not self.running:
                             return self._log_and_return_true(
                                 f"🛑 사용자 중단 감지(상세 수집 중) "
@@ -1245,121 +1358,6 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
 
         return True
 
-    # =========================================================
-    # 캡차
-    # =========================================================
-    def record_audio(self, filename: str, duration: int = 17) -> bool:
-        audio = pyaudio.PyAudio()
-        stream: Any = None
-
-        try:
-            self.log_signal_func(
-                "🎧 캡차 음성 장치 확인 시작"
-            )
-
-            wasapi_info = audio.get_host_api_info_by_type(pyaudio.paWASAPI)
-            default_speakers = audio.get_device_info_by_index(
-                wasapi_info["defaultOutputDevice"]
-            )
-
-            if not default_speakers["isLoopbackDevice"]:
-                for loopback in audio.get_loopback_device_info_generator():
-                    if not self.running:
-                        return False
-                    if default_speakers["name"] in loopback["name"]:
-                        default_speakers = loopback
-                        break
-
-            wave_format = pyaudio.paInt16
-            channels = int(default_speakers.get("maxInputChannels") or 2)
-            rate = int(default_speakers["defaultSampleRate"])
-            chunk_size = 1024
-
-            self.log_signal_func(
-                f"🎧 캡차 음성 스트림 열기 "
-                f"| 장치={default_speakers.get('name')} "
-                f"| 채널={channels} "
-                f"| rate={rate}"
-            )
-
-            stream = audio.open(
-                format=wave_format,
-                channels=channels,
-                rate=rate,
-                input=True,
-                input_device_index=default_speakers["index"],
-                frames_per_buffer=chunk_size,
-            )
-
-            self.log_signal_func(
-                f"🎙️ 캡차 음성 녹음 시작 | duration={duration}초"
-            )
-
-            frames: List[bytes] = []
-            required_chunk_count = int(
-                rate / chunk_size * duration
-            )
-
-            # stream.read()가 오디오 장치 문제로 장시간 블로킹되는 상황을 줄이기 위해
-            # 읽을 수 있는 데이터가 확보된 경우에만 stream.read()를 호출한다.
-            internal_deadline = time.monotonic() + duration + 5.0
-
-            while len(frames) < required_chunk_count:
-                if not self.running:
-                    return False
-
-                if time.monotonic() >= internal_deadline:
-                    self.log_signal_func(
-                        "⏰ 캡차 음성 녹음 내부 제한시간 초과 "
-                        f"| 수집={len(frames)}/{required_chunk_count}"
-                    )
-                    return False
-
-                available_frames = stream.get_read_available()
-
-                if available_frames < chunk_size:
-                    time.sleep(0.02)
-                    continue
-
-                frames.append(
-                    stream.read(
-                        chunk_size,
-                        exception_on_overflow=False,
-                    )
-                )
-
-            with wave.open(filename, "wb") as wave_file:
-                wave_file.setnchannels(channels)
-                wave_file.setsampwidth(
-                    audio.get_sample_size(wave_format)
-                )
-                wave_file.setframerate(rate)
-                wave_file.writeframes(b"".join(frames))
-
-            self.log_signal_func(
-                f"✅ 캡차 음성 녹음 파일 저장 완료 "
-                f"| 파일={filename} "
-                f"| chunk={len(frames)}"
-            )
-            return True
-
-        except Exception as e:
-            self.log_signal_func(f"❌ 캡차 음성 녹음 예외: {e}")
-            return False
-
-        finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                except Exception:
-                    pass
-
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-
-            audio.terminate()
 
     def handle_captcha_with_retry(self) -> int:
         captcha_cnt = self._to_int(
@@ -1422,119 +1420,41 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
 
             self.log_signal_func("🚩 캡차 발견! 해결을 시작합니다.")
 
-            if attempt == 1:
-                for _ in range(5):
-                    pyautogui.press("tab")
-                    if not self.sleep_s(random.uniform(0.1, 0.2)):
-                        self.log_signal_func(
-                            "🛑 캡차 처리 중단: tab 이동 중 sleep 실패"
-                        )
-                        return self.CAPTCHA_FAIL
-                pyautogui.press("enter")
-            else:
-                pyautogui.press("enter")
+            # 캡챠 해결 시작
+            # 6. 크롬 창의 정중앙으로 마우스 이동
+            self.move_mouse_to_window_center()
+            time.sleep(1)
 
-            # 음성 재생이 시작되기 전 짧게 대기한다.
-            if not self.sleep_s(0.4):
-                self.log_signal_func(
-                    "🛑 캡차 처리 중단: 음성 재생 전 sleep 실패"
-                )
-                return self.CAPTCHA_FAIL
+            self.save_image_to_desktop()
+        
+            # 8. 컨텐츠 복사
+            content = self.copy_content()
 
-            filename = "captcha_audio_final.wav"
+            # 9. 두 번째 탭으로 이동
+            self.move_to_tab(2)
+            time.sleep(1)
 
-            # 오디오 장치 또는 stream.read()가 장시간 응답하지 않는 상황을 막는다.
-            record_finished, record_success = self._run_with_timeout(
-                self.record_audio,
-                self.AUDIO_RECORD_TIMEOUT_SEC,
-                "캡차 음성 녹음",
-                filename,
-                17,
-            )
+            self.upload_image_and_paste_content(content)
+            time.sleep(1)
 
-            if not record_finished or not record_success:
-                if not self.running:
-                    return self.CAPTCHA_FAIL
-
-                self.log_signal_func(
-                    "🔄 캡차 음성 녹음이 제한시간 안에 완료되지 않았거나 "
-                    "실패했습니다. 브라우저 재시작 흐름으로 전환합니다."
-                )
-                # 목록/상세 호출부에서 현재 URL에 맞게
-                # 브라우저를 닫고 다시 실행한다.
-                return self.ACCESS_LIMITED
-
-            # Whisper 분석이 장시간 응답하지 않는 상황을 막는다.
-            transcribe_finished, result = self._run_with_timeout(
-                self.model.transcribe,
-                self.WHISPER_TRANSCRIBE_TIMEOUT_SEC,
-                "Whisper 음성 분석",
-                filename,
-                language="ko",
-                fp16=False,
-            )
-
-            if not transcribe_finished:
-                if not self.running:
-                    return self.CAPTCHA_FAIL
-
-                self.log_signal_func(
-                    "🔄 Whisper 음성 분석이 제한시간 안에 완료되지 않았습니다. "
-                    "브라우저 재시작 흐름으로 전환합니다."
-                )
-                # 목록/상세 호출부에서 현재 URL에 맞게
-                # 브라우저를 닫고 다시 실행한다.
-                return self.ACCESS_LIMITED
-
-            code = "".join(
-                filter(str.isdigit, result["text"])
-            )[:6]
-
-            if not code:
-                code = "123456"
-                self.log_signal_func(
-                    "⚠️ AI 인식 실패 (숫자 없음). "
-                    "기본값 '123456' 입력"
-                )
-            else:
-                self.log_signal_func(f"📝 AI 인식 코드: {code}")
-
-            if attempt == 1:
-                pyautogui.press("tab")
-                if not self.sleep_s(0.5):
-                    self.log_signal_func(
-                        "🛑 캡차 처리 중단: 입력칸 이동 후 sleep 실패"
-                    )
-                    return self.CAPTCHA_FAIL
-            else:
-                pyautogui.hotkey("shift", "tab")
-                if not self.sleep_s(0.5):
-                    self.log_signal_func(
-                        "🛑 캡차 처리 중단: shift+tab 후 sleep 실패"
-                    )
-                    return self.CAPTCHA_FAIL
-
-            pyautogui.write(
-                code,
-                interval=random.uniform(0.1, 0.2),
-            )
-
-            for _ in range(3):
-                pyautogui.press("tab")
-
+            self.move_to_tab(1)
+        
+            pyautogui.hotkey("tab")
+            pyautogui.hotkey("tab")
+            pyautogui.hotkey("ctrl", "v")
+        
+            pyautogui.hotkey("tab")
+            pyautogui.hotkey("tab")
+            pyautogui.hotkey("tab")
             pyautogui.press("enter")
-
-            self.log_signal_func("⏳ 결과 검증 대기 중...")
-            if not self.sleep_s(random.uniform(5.0, 6.0)):
-                self.log_signal_func(
-                    "🛑 캡차 처리 중단: 결과 검증 대기 sleep 실패"
-                )
-                return self.CAPTCHA_FAIL
+            # 캡챠 헤결 끝
+            return self.SUCCESS
 
         self.log_signal_func(
             f"❌ 캡차 최대 재시도 초과: {max_tries}회"
         )
         return self.CAPTCHA_FAIL
+
 
     # =========================================================
     # 목록 HTML 파싱

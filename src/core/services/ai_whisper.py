@@ -8,6 +8,15 @@ _model: Optional[Any] = None
 _lock = threading.Lock()
 
 
+
+# 모델	특징	GPU 메모리(VRAM)
+# tiny	가장 빠르지만 정확도 낮음	약 1GB
+# base	빠르고 가벼움	약 1GB
+# small	속도와 정확도의 균형	약 2GB
+# medium	small보다 일반적으로 정확하지만 느림	약 5GB
+# large	높은 정확도, 느리고 메모리 사용량 큼	약 10GB
+# turbo	large-v3를 빠르게 최적화한 모델	약 6GB
+
 def init(model_size: str = "small") -> None:
     global _model
 

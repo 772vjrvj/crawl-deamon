@@ -696,7 +696,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
     
         return content
 
-    
+    # GPT 이미지 업로드
     def upload_image_and_paste_content(self, content: str) -> None:
         # 바탕화면의 test.png 경로
         image_path = os.path.join(self.get_desktop_path(), "test_test_test.png")
@@ -712,38 +712,39 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         pyautogui.press("enter")
     
         # 파일 선택 창이 열릴 때까지 대기
-        time.sleep(2)
+        time.sleep(3)
     
         # 이미지 경로 입력 후 선택
+        pyautogui.hotkey("ctrl", "a")
         pyperclip.copy(image_path)
         pyautogui.hotkey("ctrl", "v")
         pyautogui.press("enter")
     
         # 이미지 업로드 및 입력창 포커스 이동 대기
-        time.sleep(3)
+        time.sleep(10)
     
         # 내용 붙여넣기
         pyperclip.copy(content)
         pyautogui.hotkey("ctrl", "v")
         pyautogui.press("enter")
+
+        # GPT 정답 대기
+        time.sleep(30)
     
-        time.sleep(18)
-    
-    
+        # GPT 정답 복사
         # Shift + Tab 두 번
         pyautogui.hotkey("shift", "tab")
         time.sleep(1)
         pyautogui.hotkey("shift", "tab")
         time.sleep(1)
-    
         # Tab 한 번
         pyautogui.press("tab")
         time.sleep(1)
-    
         # Enter
         pyautogui.press("enter")
         time.sleep(2)
-    
+
+        # GPT input이동
         pyautogui.hotkey("tab")
         pyautogui.hotkey("tab")
         pyautogui.hotkey("tab")

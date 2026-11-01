@@ -581,7 +581,7 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
         pyautogui.moveTo(center_x, center_y, duration=0.5)
 
         print(f"마우스 이동 완료: x={center_x}, y={center_y}")
-    
+
     
     def get_desktop_path(self) -> str:
         """Windows에 설정된 실제 바탕화면 경로를 가져온다."""
@@ -599,7 +599,10 @@ class NaverShopTotalDetailWorker(DaemonBaseWorker):
     def save_image_to_desktop(self):
         """마우스 위치의 이미지를 우클릭 메뉴를 통해 바탕화면에 저장한다."""
         save_path = os.path.join(self.get_desktop_path(), "test_test_test.png")
-    
+
+        pyautogui.leftClick()
+        time.sleep(0.7)
+
         # 이미지 위에서 우클릭
         pyautogui.rightClick()
         time.sleep(0.7)
